@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Space Lord Bot",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/homey_bot_space_lord.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "python": "${workspaceFolder}/venviron/Scripts/python.exe",
+            "justMyCode": true,
+            "stopOnEntry": false
+        },
+        {
+            "name": "Launch Space Lord Bot (Debug)",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/homey_bot_space_lord.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "python": "${workspaceFolder}/venviron/Scripts/python.exe",
+            "justMyCode": false,
+            "stopOnEntry": false
+        }
+    ]
+}

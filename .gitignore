@@ -1,0 +1,36 @@
+# Secrets and local config (never commit)
+config.yaml
+.env
+.env.*
+
+# TwitchIO token cache
+.tio.tokens.json
+
+# Virtual environments
+venviron/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and runtime
+*.log
+twitch_messages.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+
+# Temp TTS/audio artifacts
+temp_tts_*.wav
+temp_tts_*.mp3

@@ -1,0 +1,45 @@
+# Copy this file to config.yaml and fill in your values (config.yaml is gitignored).
+
+twitch:
+  bot_token: "oauth:YOUR_BOT_USER_ACCESS_TOKEN"
+  refresh_token: "YOUR_REFRESH_TOKEN_IF_YOU_HAVE_ONE"
+  client_id: "YOUR_TWITCH_APP_CLIENT_ID"
+  client_secret: "YOUR_TWITCH_APP_CLIENT_SECRET"
+  channel: "your_channel_login"
+  bot_username: "your_bot_login"
+  bot_id: "123456789"
+  broadcaster_user_id: ""
+  always_read_chat: true
+  space_lord_enabled: true
+
+discord:
+  bot_token: "YOUR_DISCORD_BOT_TOKEN"
+  voice_channel_id: "0"
+  persona_channel_id: 0
+  memories_channel_id: 0
+
+openai:
+  api_key: "YOUR_OPENAI_API_KEY"
+  model: "gpt-3.5-turbo"
+  max_tokens: 150
+  temperature: 0.7
+
+audio:
+  device: "default"
+
+voices:
+  mudflap:
+    name: "en-US-JennyNeural"
+    rate: 100
+  space_lord:
+    name: "en-US-ChristopherNeural"
+    rate: 100
+
+debug:
+  enabled: false
+  log_level: INFO
+
+logging:
+  level: "DEBUG"
+  format: "%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"

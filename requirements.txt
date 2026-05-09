@@ -1,0 +1,28 @@
+# Homey Bot Desktop Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+pygame>=2.0.0
+twitchio>=2.0.0
+pyyaml>=6.0
+
+# TTS system
+pywin32>=305      # Windows TTS (female voice support)
+
+# Optional GUI
+# tkinter (usually comes with Python)
+
+# Audio processing
+pyaudio>=0.2.11
+
+# AI/OpenAI for Space Lord
+openai>=1.0.0
+
+# Advanced logging for Space Lord
+loguru>=0.7.0
+
+# HTTP client for Space Lord
+httpx>=0.24.0
+
+# Voice recognition for wake word detection
+SpeechRecognition>=3.10.0 
