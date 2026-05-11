@@ -1,9 +1,11 @@
 # Homey Bot Desktop Dependencies
 # Install with: pip install -r requirements.txt
+# Behind HTTPS inspection / broken CA chain to PyPI, add:
+#   --trusted-host pypi.org --trusted-host files.pythonhosted.org
 
 # Core dependencies
 pygame>=2.0.0
-twitchio>=2.0.0
+twitchio[starlette]>=3.0.0   # Starlette adapter for TwitchIO web/EventSub tooling
 pyyaml>=6.0
 
 # TTS system
@@ -17,6 +19,7 @@ pyaudio>=0.2.11
 
 # AI/OpenAI for Space Lord
 openai>=1.0.0
+truststore>=0.10.0  # OS trust store — fixes TLS behind corporate HTTPS inspection on Windows/Mac
 
 # Advanced logging for Space Lord
 loguru>=0.7.0
@@ -25,4 +28,8 @@ loguru>=0.7.0
 httpx>=0.24.0
 
 # Voice recognition for wake word detection
-SpeechRecognition>=3.10.0 
+SpeechRecognition>=3.10.0
+
+# Space Lord persona / memories from Discord (voice extra = PyNaCl + davey for discord.py voice)
+discord.py[voice]>=2.3.0
+discord-ext-voice-recv==0.5.2a179  # alpha on PyPI — receive Discord VC audio for Whisper transcription

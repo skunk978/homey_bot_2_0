@@ -1,3 +1,22 @@
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Local config with secrets
+config.yaml
+
+# Virtual environments
+venv/
+venviron/
+.venv/
+
+# Editor settings
+.vscode/
+
+# OS / misc
+.DS_Store
+Thumbs.db
+
 # Secrets and local config (never commit)
 config.yaml
 .env

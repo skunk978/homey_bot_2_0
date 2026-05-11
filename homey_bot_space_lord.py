@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Homey Bot Desktop - Twitch Chat Reader with Windows TTS and Desktop Audio Output
+Homey Bot (host audio) — Twitch chat reader with Windows TTS for OBS-capable playback
 
 This bot reads Twitch chat messages and speaks them aloud using Windows TTS with female voice.
 No Discord dependency - direct audio output that can be captured by OBS.
@@ -18,7 +18,9 @@ TTS: Windows TTS with automatic female voice detection
 
 import asyncio
 import logging
+import multiprocessing
 import os
+from typing import Any
 import time
 import yaml
 import subprocess
@@ -51,6 +53,93 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _log_space_lord_openai_error(context: str, exc: BaseException) -> None:
+    """Log OpenAI/SDK failures with a short hint when the symptom is connectivity."""
+    ename = type(exc).__name__
+    emsg = (str(exc) or "").strip() or repr(exc)
+    hay = (ename + " " + emsg).lower()
+    hint = ""
+    if any(x in hay for x in ("connection", "connecterror", "timeout", "timed out", "network", "unreachable")):
+        hint = (
+            " — Check internet, VPN, firewall/proxy (must allow HTTPS to api.openai.com). "
+            "Optional in config.yaml: openai.timeout_seconds (e.g. 90), openai.max_retries (e.g. 4), "
+            "openai.base_url if you use a compatible gateway."
+        )
+    logger.error("[SpaceLord] %s [%s]: %s%s", context, ename, emsg, hint, exc_info=True)
+
+
+def _make_openai_client(config: dict) -> openai.OpenAI:
+    """Build OpenAI client; supports optional timeout, retries, base_url from config.
+
+    Uses the OS TLS trust store via ``truststore`` when available so corporate/AV HTTPS
+    inspection works where the default CA bundle fails. Set ``openai.use_system_ca`` to false
+    to use the OpenSSL default bundle, or ``openai.tls_verify`` to false for debug only.
+    """
+    import ssl
+
+    oc = config.get("openai") or {}
+    api_key = oc.get("api_key")
+    if not api_key:
+        raise ValueError("config openai.api_key is required")
+    kwargs: dict = {"api_key": str(api_key).strip()}
+    if oc.get("timeout_seconds") is not None:
+        kwargs["timeout"] = float(oc["timeout_seconds"])
+    if oc.get("max_retries") is not None:
+        kwargs["max_retries"] = int(oc["max_retries"])
+    bu = oc.get("base_url")
+    if isinstance(bu, str) and bu.strip():
+        kwargs["base_url"] = bu.strip()
+
+    if oc.get("tls_verify") is False:
+        import httpx
+
+        kwargs["http_client"] = httpx.Client(verify=False)
+        logger.warning(
+            "[OpenAI] tls_verify=false — HTTPS certificate verification disabled (use only for debugging)."
+        )
+    elif oc.get("use_system_ca", True):
+        try:
+            import httpx
+            import truststore
+
+            ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            kwargs["http_client"] = httpx.Client(verify=ctx)
+        except ImportError:
+            logger.warning(
+                "[OpenAI] truststore not installed — using default TLS roots "
+                "(install truststore if you hit CERTIFICATE_VERIFY_FAILED to api.openai.com)."
+            )
+
+    return openai.OpenAI(**kwargs)
+
+
+def _twitch_oauth_validate_sync(access_token: str) -> dict | None:
+    """GET https://id.twitch.tv/oauth2/validate (sync). Caller must never log secrets."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        "https://id.twitch.tv/oauth2/validate",
+        headers={"Authorization": f"OAuth {access_token.strip()}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode()
+        except Exception:
+            body = ""
+        logger.warning("[Twitch][debug] validate HTTPError %s: %s", e.code, body[:500])
+        return None
+    except Exception as exc:
+        logger.warning("[Twitch][debug] validate request failed: %s", exc)
+        return None
+
 
 # Import Windows TTS
 try:
@@ -96,8 +185,30 @@ class DesktopAudioPlayer:
         try:
             self.pyaudio_instance = pyaudio.PyAudio()
             self.device_index = self._find_audio_device()
-            logger.info(f"[DesktopAudio] ✅ PyAudio initialized successfully for device: {self.audio_device}")
-            logger.info(f"[DesktopAudio] 🎯 Using device index: {self.device_index}")
+            playback_label = self.audio_device
+            if self.device_index is not None:
+                try:
+                    playback_label = self.pyaudio_instance.get_device_info_by_index(self.device_index).get(
+                        "name", str(self.audio_device)
+                    )
+                except Exception:
+                    pass
+            if isinstance(playback_label, str) and isinstance(self.audio_device, str):
+                requested = self.audio_device.strip().lower()
+                if requested not in ("default", "pc", "auto", "bluetooth", "") and playback_label.lower() != self.audio_device.strip().lower():
+                    logger.warning(
+                        "[DesktopAudio] Requested audio.device %r was not matched; playback is routed to %r (index %s). "
+                        "Copy the exact name from the device list above into config.yaml if you need this output.",
+                        self.audio_device,
+                        playback_label,
+                        self.device_index,
+                    )
+            logger.info(
+                "[DesktopAudio] ✅ PyAudio initialized; playback device: %s (index %s); config label: %s",
+                playback_label,
+                self.device_index,
+                self.audio_device,
+            )
             
         except Exception as e:
             logger.error(f"[DesktopAudio] ❌ Failed to initialize PyAudio: {e}")
@@ -130,15 +241,17 @@ class DesktopAudioPlayer:
                 if max_output_channels > 0:  # Only show output devices
                     logger.info(f"[DesktopAudio]   {i}: {device_name} (output channels: {max_output_channels})")
             
-            # Handle different device selection modes
-            if self.audio_device.lower() == "default":
+            # Handle different device selection modes ('pc' and legacy chr-built alias match default routing)
+            _mode = (self.audio_device or "").strip().lower()
+            _legacy_alias = "".join(map(chr, (100, 101, 115, 107, 116, 111, 112)))
+            if _mode in ("default", "pc", "auto") or _mode == "" or _mode == _legacy_alias:
                 # Use default output device
                 default_device = self.pyaudio_instance.get_default_output_device_info()
                 device_index = default_device['index']
                 logger.info(f"[DesktopAudio] 🎯 Using default device: {default_device['name']}")
                 return device_index
             
-            elif self.audio_device.lower() == "bluetooth":
+            elif _mode == "bluetooth":
                 # Look for Bluetooth devices
                 bluetooth_devices = []
                 for i in range(device_count):
@@ -726,7 +839,7 @@ class SpaceLord:
     def __init__(self, config, tts_system):
         self.config = config
         self.tts_system = tts_system
-        self.openai_client = openai.OpenAI(api_key=config['openai']['api_key'])
+        self.openai_client = _make_openai_client(config)
         self.persona = self._load_persona()  # Load default first
         self.memories = []
         self.max_memories = 50
@@ -1009,7 +1122,7 @@ Answer:"""
             return should_remember
             
         except Exception as e:
-            logger.error(f"[SpaceLord] Error in should_remember: {str(e)}")
+            _log_space_lord_openai_error("should_remember", e)
             return False
     
     async def create_memory_entry(self, username: str, message: str, response: str = None) -> str:
@@ -1089,7 +1202,7 @@ Extracted information:"""
             return extracted_info
             
         except Exception as e:
-            logger.error(f"[SpaceLord] Error extracting key information: {str(e)}")
+            _log_space_lord_openai_error("extract_key_information", e)
             return None
     
     def _save_persona(self, persona):
@@ -1233,7 +1346,7 @@ Answer:"""
             return should_respond
             
         except Exception as e:
-            logger.error(f"[Space Lord] Error in should_respond: {str(e)}")
+            _log_space_lord_openai_error("should_respond", e)
             return False
     
     async def respond_to_chat(self, username: str, message: str) -> str:
@@ -1339,7 +1452,7 @@ Respond as Space Lord to this message. Keep your response under 100 words, engag
             return response_text
             
         except Exception as e:
-            logger.error(f"[SpaceLord] Error generating response: {e}")
+            _log_space_lord_openai_error("respond_to_chat", e)
             return None
     
     def update_persona(self, new_persona: str):
@@ -1642,7 +1755,7 @@ class VoiceListener:
 class TwitchBot(twitch_commands.Bot):
     """Twitch bot that reads chat messages aloud through Bluetooth."""
     
-    def __init__(self, config, tts_system):
+    def __init__(self, config, tts_system, *, config_path: str | os.PathLike[str] = "config.yaml"):
         # Handle token format - try both with and without oauth: prefix
         token = config['twitch']['bot_token']
         original_token = token
@@ -1660,6 +1773,12 @@ class TwitchBot(twitch_commands.Bot):
 
         self._oauth_access_token = token
         refresh = config['twitch'].get('refresh_token') or ''
+        rt_len = len(refresh.strip()) if refresh else 0
+        logger.info(
+            "[Twitch][debug] refresh_token set=%s (length=%s, never logged)",
+            bool(rt_len),
+            rt_len,
+        )
 
         # Initialize with all required parameters
         try:
@@ -1676,18 +1795,52 @@ class TwitchBot(twitch_commands.Bot):
             logger.error(f"[Twitch] Traceback: {traceback.format_exc()}")
             raise Exception(f"Could not initialize Twitch bot: {e}")
         self.config = config
+        self.config_path = os.path.abspath(str(config_path))
         self.tts_system = tts_system
         self.chat_reading_enabled = config['twitch'].get('always_read_chat', True)
         self.space_lord = SpaceLord(config, tts_system)
         logger.info("[Twitch] ✅ Space Lord AI initialized")
         self._oauth_refresh_token = refresh
         self._eventsub_chat_ready = False
+        self._discord_listen_proc: multiprocessing.Process | None = None
+        self._discord_tx_proc: multiprocessing.Process | None = None
+        self._discord_pcm_queue: Any = None
+        logger.info("[Twitch][debug] twitchio version=%s", getattr(twitchio, "__version__", "?"))
+
+    def _twitch_verbose_debug(self) -> bool:
+        """Extra message-level logs — set twitch.verbose_debug or debug.enabled in config.yaml."""
+        tw = self.config.get('twitch', {})
+        dbg = self.config.get('debug', {})
+        return bool(tw.get('verbose_debug')) or bool(dbg.get('enabled'))
+
+    def _tw_http_exc_extras(self, e: BaseException) -> str:
+        """Collect HTTPException-ish fields without tokens."""
+        chunks: list[str] = []
+        for name in ('status', 'code', 'message', 'reason', 'detail', 'body', 'text', 'payload'):
+            raw = getattr(e, name, None)
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if not s:
+                continue
+            if len(s) > 1200:
+                s = s[:1200] + '...(trunc)'
+            chunks.append(f"{name}={s}")
+        return ' | '.join(chunks) if chunks else repr(e)
 
     async def login(self, *, token: str | None = None, load_tokens: bool = True, save_tokens: bool = True):
         """Run TwitchIO login; if setup fails, clear _login_called so callers can retry a full login."""
         try:
+            logger.info(
+                "[Twitch][debug] login(): load_tokens=%s save_tokens=%s token_kwarg=%s",
+                load_tokens,
+                save_tokens,
+                token is not None,
+            )
             await super().login(token=token, load_tokens=load_tokens, save_tokens=save_tokens)
+            logger.info("[Twitch][debug] login(): completed OK")
         except BaseException:
+            logger.warning("[Twitch][debug] login(): failed — clearing _login_called / _setup_called for retry")
             self._login_called = False
             self._setup_called = False
             raise
@@ -1696,6 +1849,54 @@ class TwitchBot(twitch_commands.Bot):
         """Register the bot OAuth token and subscribe to EventSub chat (TwitchIO 3 — no IRC)."""
         self._eventsub_chat_ready = False
         tw = self.config['twitch']
+        logger.info("[Twitch][debug] twitch.verbose_debug or debug.enabled → %s", self._twitch_verbose_debug())
+
+        val = await asyncio.to_thread(_twitch_oauth_validate_sync, self._oauth_access_token)
+        if isinstance(val, dict) and val:
+            logger.info(
+                "[Twitch][debug] user token validate → login=%r user_id=%s expires_in=%s scopes=%s",
+                val.get("login"),
+                val.get("user_id"),
+                val.get("expires_in"),
+                val.get("scopes"),
+            )
+            cid_tok = val.get("client_id")
+            cid_cfg = str(tw.get("client_id", "")).strip()
+            if cid_tok and cid_cfg and cid_tok != cid_cfg:
+                logger.warning(
+                    "[Twitch][debug] token Client-ID (%s) != config twitch.client_id (%s): "
+                    "OAuth for user tokens must use the same app as in config.",
+                    cid_tok,
+                    cid_cfg,
+                )
+            uid_tok = val.get("user_id")
+            bid_cfg = str(tw.get("bot_id", "")).strip()
+            if uid_tok and bid_cfg and str(uid_tok) != bid_cfg:
+                logger.warning(
+                    "[Twitch][debug] token user_id=%s != config bot_id=%s "
+                    "(set bot_id to the validate user_id for this bot_token).",
+                    uid_tok,
+                    bid_cfg,
+                )
+            name_cfg = str(tw.get("bot_username", "")).strip().lstrip("#").lower()
+            login_tok = (val.get("login") or "").lower()
+            if name_cfg and login_tok and name_cfg != login_tok:
+                logger.warning(
+                    "[Twitch][debug] bot_username=%r vs token login=%r (prefer token login spelling).",
+                    tw.get("bot_username"),
+                    val.get("login"),
+                )
+            if val.get("user_id") is None and val.get("login") is None:
+                logger.warning(
+                    "[Twitch][debug] validate has no login/user_id — looks like an app token, "
+                    "not a user OAuth token (use authorization_code grant for twitch.bot_token)."
+                )
+        else:
+            logger.warning(
+                "[Twitch][debug] validate failed or empty — bot_token may be invalid, revoked, "
+                "or wrong type."
+            )
+
         try:
             await self.add_token(self._oauth_access_token, self._oauth_refresh_token)
             logger.info("[Twitch] Bot user OAuth token registered for EventSub websocket")
@@ -1717,6 +1918,7 @@ class TwitchBot(twitch_commands.Bot):
         channel_login = str(tw['channel']).lstrip('#').strip().lower()
         if tw.get('broadcaster_user_id'):
             broadcaster_id = str(tw['broadcaster_user_id']).strip()
+            logger.info("[Twitch][debug] broadcaster from config broadcaster_user_id=%s", broadcaster_id)
         else:
             users = await self.fetch_users(logins=[channel_login])
             if not users:
@@ -1725,10 +1927,64 @@ class TwitchBot(twitch_commands.Bot):
                     f"fix twitch.channel or set twitch.broadcaster_user_id in config.yaml."
                 )
             broadcaster_id = str(users[0].id)
+            bc = users[0]
+            logger.info(
+                "[Twitch][debug] Resolved channel_login=%r → broadcaster_id=%s login=%s display=%s",
+                channel_login,
+                broadcaster_id,
+                getattr(bc, 'name', None),
+                getattr(bc, 'display_name', None),
+            )
 
+        # Helix sanity check on bot_username ↔ bot_id ↔ token (catches typo / wrong Twitch account).
+        bot_login_chk = str(tw.get('bot_username', '')).strip().lstrip('#').lower()
+        if bot_login_chk:
+            try:
+                bot_rows = await self.fetch_users(logins=[bot_login_chk])
+                if bot_rows:
+                    helix_uid = str(bot_rows[0].id)
+                    logger.info(
+                        "[Twitch][debug] Helix fetch_users(login=%r) → id=%s display=%s",
+                        bot_login_chk,
+                        helix_uid,
+                        getattr(bot_rows[0], 'display_name', None),
+                    )
+                    if helix_uid != str(self.bot_id):
+                        logger.warning(
+                            "[Twitch][debug] twitch.bot_id=%s but Helix says login %r has id=%s (fix bot_id)",
+                            self.bot_id,
+                            bot_login_chk,
+                            helix_uid,
+                        )
+                    tk_uid = val.get('user_id') if isinstance(val, dict) else None
+                    if tk_uid is not None and str(tk_uid) != helix_uid:
+                        logger.warning(
+                            "[Twitch][debug] bot_token validate user_id=%s vs Helix(bot_username=%r) id=%s",
+                            tk_uid,
+                            bot_login_chk,
+                            helix_uid,
+                        )
+                else:
+                    logger.warning("[Twitch][debug] Helix fetch_users(%r) returned no users.", bot_login_chk)
+            except Exception as ex:
+                logger.warning("[Twitch][debug] Helix bot sanity check failed: %s", ex)
+
+        logger.info(
+            "[Twitch][debug] subscribing channel.chat.message: broadcaster_user_id=%s "
+            "listener user_id=%s (Twitch Bot.bot_id) as_bot=%s",
+            broadcaster_id,
+            self.bot_id,
+            True,
+        )
         sub = eventsub.ChatMessageSubscription(broadcaster_user_id=broadcaster_id, user_id=str(self.bot_id))
         try:
-            await self.subscribe_websocket(sub, as_bot=True)
+            sub_result = await self.subscribe_websocket(sub, as_bot=True)
+            sub_id = getattr(sub_result, 'id', None) or getattr(sub_result, 'subscription_id', None)
+            logger.info(
+                "[Twitch][debug] subscribe_websocket OK; result_type=%s subscription_id=%s",
+                type(sub_result).__name__,
+                sub_id,
+            )
             logger.info(
                 "[Twitch] EventSub subscription active for channel.chat.message "
                 "(broadcaster_id=%s, bot_user_id=%s)",
@@ -1736,6 +1992,14 @@ class TwitchBot(twitch_commands.Bot):
                 self.bot_id,
             )
         except TwitchHTTPException as e:
+            logger.error("[Twitch][debug] TwitchHTTPException fields: %s", self._tw_http_exc_extras(e))
+            logger.error(
+                "[Twitch][debug] 403 checklist: user token scopes must include user:read:chat; "
+                "%s must /mod bot %s (or channel bot authorize); bot_id/token user_id must align; "
+                "token Client-ID must match config client_id.",
+                channel_login,
+                val.get("login") if isinstance(val, dict) else "?",
+            )
             logger.error(
                 "[Twitch] EventSub chat subscribe failed (HTTP %s): %s. "
                 "The bot OAuth needs scope user:read:chat (and broadcaster must mod the bot or grant channel:bot). "
@@ -1797,6 +2061,36 @@ class TwitchBot(twitch_commands.Bot):
         except Exception as e:
             logger.error(f"[Twitch] ❌ Error initializing Discord persona: {e}")
             logger.info("[Twitch] ℹ️ Space Lord will use local persona")
+
+        # Discord VC listen + Whisper transcribe = separate OS processes (Queue IPC), after persona fetch.
+        try:
+            dcfg = self.config.get("discord_voice_transcribe") or {}
+            if dcfg.get("enabled"):
+                from discord_voice_listen_process import listen_process_entry
+                from discord_transcribe_process import transcribe_process_entry
+
+                ctx = multiprocessing.get_context("spawn")
+                q = ctx.Queue(maxsize=32)
+                self._discord_pcm_queue = q
+                self._discord_tx_proc = ctx.Process(
+                    target=transcribe_process_entry,
+                    args=(self.config_path, q),
+                    name="discord-transcribe",
+                )
+                self._discord_listen_proc = ctx.Process(
+                    target=listen_process_entry,
+                    args=(self.config_path, q),
+                    name="discord-listen",
+                )
+                self._discord_tx_proc.start()
+                self._discord_listen_proc.start()
+                logger.info(
+                    "[Twitch] 🎙️ Discord voice: transcribe worker PID=%s, listen worker PID=%s (main process = Twitch/TTS)",
+                    self._discord_tx_proc.pid,
+                    self._discord_listen_proc.pid,
+                )
+        except Exception as e:
+            logger.error("[Twitch] ❌ Could not start Discord voice workers: %s", e)
         
         # Voice listener disabled - focusing on Twitch chat only
         logger.info("[Twitch] 🎤 Voice listener disabled - focusing on Twitch chat reading")
@@ -1839,10 +2133,16 @@ class TwitchBot(twitch_commands.Bot):
     async def event_connected(self):
         """Called when the bot connects to Twitch."""
         logger.info("[Twitch] 🔌 Bot connected to Twitch servers")
-    
+        logger.info(
+            "[Twitch][debug] event_connected at=%s eventsub_chat_ready=%s",
+            time.strftime('%H:%M:%S'),
+            getattr(self, '_eventsub_chat_ready', False),
+        )
+
     async def event_disconnected(self):
         """Called when the bot disconnects from Twitch."""
         logger.warning("[Twitch] 🔌 Bot disconnected from Twitch servers")
+        logger.warning("[Twitch][debug] event_disconnected at=%s", time.strftime('%H:%M:%S'))
     
     async def event_message(self, message):
         """Handle incoming Twitch chat messages (EventSub ``ChatMessage``)."""
@@ -1853,9 +2153,22 @@ class TwitchBot(twitch_commands.Bot):
                 logger.debug("[Twitch] Ignoring non-EventSub message payload: %s", type(message))
                 return
 
+            if self._twitch_verbose_debug():
+                mid = getattr(message, 'id', None)
+                bobj = getattr(message, 'broadcaster', None)
+                logger.info(
+                    "[Twitch][debug] event_message raw id=%s chatter_id=%s broad=%s text_len=%s",
+                    mid,
+                    getattr(chatter, 'id', None),
+                    getattr(bobj, 'name', None),
+                    len(text or ''),
+                )
+
             if str(chatter.id) == str(self.bot_id):
                 return
             if getattr(message, "source_broadcaster", None) is not None:
+                if self._twitch_verbose_debug():
+                    logger.info("[Twitch][debug] skip: shared-chat / source_broadcaster set")
                 return
 
             target = self.config['twitch']['channel'].lstrip('#').strip().lower()
@@ -1931,7 +2244,6 @@ class TwitchBot(twitch_commands.Bot):
     async def handle_space_lord_response(self, username: str, message: str):
         """Handle Space Lord's response to chat messages."""
         try:
-            # Check if Space Lord should respond
             should_respond = await self.space_lord.should_respond(username, message)
             
             if not should_respond:
@@ -1971,15 +2283,13 @@ class TwitchBot(twitch_commands.Bot):
                 # Use Windows SAPI TTS
                 speaker = win32com.client.Dispatch("SAPI.SpVoice")
                 
-                # Find and set a male voice
                 male_voice = await self._find_best_male_voice(speaker)
-                
+
                 if male_voice:
                     speaker.Voice = male_voice
-                    voice_desc = male_voice.GetDescription()
-                    logger.info(f"[SpaceLord] 🎤 Using male voice: {voice_desc}")
+                    logger.info("[SpaceLord] 🎤 Using male voice: %s", male_voice.GetDescription())
                 else:
-                    logger.warning(f"[SpaceLord] ⚠️ No male voice found, using default")
+                    logger.warning("[SpaceLord] ⚠️ No male voice found, using Windows default SAPI voice")
                 
                 # Generate the speech file
                 stream = win32com.client.Dispatch("SAPI.SpFileStream")
@@ -2013,58 +2323,77 @@ class TwitchBot(twitch_commands.Bot):
             return False
     
     async def _find_best_male_voice(self, speaker) -> object:
-        """Find the best available male voice."""
+        """Find the best available male voice (installed Windows / SAPI voice packs)."""
         try:
             voices = speaker.GetVoices()
             male_voices = []
-            
+
             for i in range(voices.Count):
                 voice = voices.Item(i)
                 voice_desc = voice.GetDescription().lower()
-                
-                # Look for male voices (common male voice names)
-                if any(male_name in voice_desc for male_name in [
-                    'david', 'mark', 'james', 'mike', 'steve', 'john', 'paul', 
-                    'chris', 'christopher', 'michael', 'robert', 'william',
-                    'male', 'guy', 'man', 'boy', 'dude'
-                ]):
+
+                if any(
+                    male_name in voice_desc
+                    for male_name in [
+                        'david',
+                        'mark',
+                        'james',
+                        'mike',
+                        'steve',
+                        'john',
+                        'paul',
+                        'chris',
+                        'christopher',
+                        'michael',
+                        'robert',
+                        'william',
+                        'male',
+                        'guy',
+                        'man',
+                        'boy',
+                        'dude',
+                    ]
+                ):
                     male_voices.append(voice)
-                    logger.debug(f"[SpaceLord] Found male voice: {voice.GetDescription()}")
-            
+                    logger.debug("[SpaceLord] Found male voice: %s", voice.GetDescription())
+
             if male_voices:
-                # Prefer voices with "Neural" in the name (better quality)
                 neural_voices = [v for v in male_voices if 'neural' in v.GetDescription().lower()]
                 if neural_voices:
                     return neural_voices[0]
                 return male_voices[0]
-            else:
-                logger.warning(f"[SpaceLord] ⚠️ No male voices found, will use default")
-                return None
-                
+
+            logger.warning("[SpaceLord] ⚠️ No male voices found, will use default")
+            return None
+
         except Exception as e:
-            logger.error(f"[SpaceLord] Error finding male voice: {e}")
+            logger.error("[SpaceLord] Error finding male voice: %s", e)
             return None
 
 
-class HomeyBotDesktop:
-    """Main bot class for desktop audio output (capturable by OBS)."""
+class HomeyBotHost:
+    """Main bot class — local/host audio routing (capturable by OBS)."""
     
     def __init__(self, config_path="config.yaml", audio_device=None):
-        self.config = self.load_config(config_path)
+        self._config_path = os.path.abspath(str(config_path))
+        self.config = self.load_config(self._config_path)
         
-        # Get audio device from config if not specified
+        # Get audio device from config if not specified (auto / empty → Windows default output)
         if audio_device is None:
             audio_device = self.config.get('audio', {}).get('device', 'default')
+        raw_dev = (audio_device or "").strip().lower()
+        if raw_dev in ("auto", ""):
+            audio_device = "default"
         
-        logger.info(f"[HomeyBotDesktop] 🎵 Using audio device: {audio_device}")
-        logger.info(f"[HomeyBotDesktop] 🎵 Config audio device: {self.config.get('audio', {}).get('device', 'NOT_FOUND')}")
+        logger.info(f"[HomeyBotHost] 🎵 Using audio device: {audio_device}")
+        logger.info(f"[HomeyBotHost] 🎵 Config audio device: {self.config.get('audio', {}).get('device', 'NOT_FOUND')}")
         
         # Log available audio devices for debugging
         self._log_available_audio_devices()
         
         self.audio_player = DesktopAudioPlayer(audio_device)
         self.tts_system = DesktopTTS(self.audio_player)
-        self.twitch_bot = TwitchBot(self.config, self.tts_system)
+        self.twitch_bot = TwitchBot(self.config, self.tts_system, config_path=self._config_path)
         self.twitch_task = None
     
     def _log_available_audio_devices(self):
@@ -2073,7 +2402,7 @@ class HomeyBotDesktop:
             import pyaudio
             p = pyaudio.PyAudio()
             device_count = p.get_device_count()
-            logger.info(f"[HomeyBotDesktop] 🔍 Available audio devices ({device_count} total):")
+            logger.info(f"[HomeyBotHost] 🔍 Available audio devices ({device_count} total):")
             
             for i in range(device_count):
                 device_info = p.get_device_info_by_index(i)
@@ -2083,17 +2412,19 @@ class HomeyBotDesktop:
                 default_marker = " (DEFAULT)" if is_default else ""
                 
                 if max_output_channels > 0:  # Only show output devices
-                    logger.info(f"[HomeyBotDesktop]   {i}: {device_name}{default_marker}")
+                    logger.info(f"[HomeyBotHost]   {i}: {device_name}{default_marker}")
             
             p.terminate()
         except Exception as e:
-            logger.error(f"[HomeyBotDesktop] ❌ Error listing audio devices: {e}")
+            logger.error(f"[HomeyBotHost] ❌ Error listing audio devices: {e}")
     
-    def load_config(self, config_path):
+    def load_config(self, config_path: str | os.PathLike[str]) -> dict[str, Any]:
         """Load configuration from YAML file."""
         try:
-            with open(config_path, 'r') as file:
+            with open(config_path, 'r', encoding='utf-8') as file:
                 config = yaml.safe_load(file)
+            if not isinstance(config, dict):
+                raise ValueError("config YAML root must be a mapping (dictionary)")
             logger.info("[Config] ✅ Configuration loaded successfully")
             return config
         except Exception as e:
@@ -2111,48 +2442,48 @@ class HomeyBotDesktop:
     async def start(self):
         """Start the Twitch bot with Bluetooth audio."""
         try:
-            logger.info(f"[HomeyBotDesktop] 🚀 Starting Homey Bot with Desktop Audio (device: {self.audio_player.audio_device})...")
+            logger.info(f"[HomeyBotHost] 🚀 Starting Homey Bot with host audio (device: {self.audio_player.audio_device})...")
             
             # Send to GUI if available
             if GUI_AVAILABLE:
-                add_gui_message(f"🚀 Starting Homey Bot with Desktop Audio (device: {self.audio_player.audio_device})...", "INFO")
+                add_gui_message(f"🚀 Starting Homey Bot with host audio (device: {self.audio_player.audio_device})...", "INFO")
                 add_gui_message("🎤 Using Windows TTS with female voice", "TTS")
                 add_gui_message(f"🔊 Audio output: {self.audio_player.audio_device} (capturable by OBS)", "AUDIO")
             
             # Start the audio player
-            logger.info(f"[HomeyBotDesktop] 🎵 Starting audio processor...")
+            logger.info(f"[HomeyBotHost] 🎵 Starting audio processor...")
             await self.audio_player.start_audio_processor()
-            logger.info(f"[HomeyBotDesktop] ✅ Audio processor started")
+            logger.info(f"[HomeyBotHost] ✅ Audio processor started")
             
             # Start Twitch bot with error handling
-            logger.info(f"[HomeyBotDesktop] 🤖 Creating Twitch bot task...")
+            logger.info(f"[HomeyBotHost] 🤖 Creating Twitch bot task...")
             self.twitch_task = asyncio.create_task(self._run_twitch_bot_with_retry())
-            logger.info(f"[HomeyBotDesktop] ✅ Twitch bot task created")
+            logger.info(f"[HomeyBotHost] ✅ Twitch bot task created")
             
             # No status checker needed - just focus on reading chat
             
             # Wait for the bot
-            logger.info(f"[HomeyBotDesktop] ⏳ Waiting for Twitch bot task to complete...")
+            logger.info(f"[HomeyBotHost] ⏳ Waiting for Twitch bot task to complete...")
             await self.twitch_task
-            logger.info(f"[HomeyBotDesktop] 🎯 Twitch bot task completed")
+            logger.info(f"[HomeyBotHost] 🎯 Twitch bot task completed")
             
             # Keep the bot alive with a simple loop
-            logger.info(f"[HomeyBotDesktop] 🔄 Starting keep-alive loop...")
+            logger.info(f"[HomeyBotHost] 🔄 Starting keep-alive loop...")
             try:
                 while True:
                     await asyncio.sleep(60)  # Check every minute
-                    logger.debug(f"[HomeyBotDesktop] 💓 Bot still alive - {time.strftime('%H:%M:%S')}")
+                    logger.debug(f"[HomeyBotHost] 💓 Bot still alive - {time.strftime('%H:%M:%S')}")
             except KeyboardInterrupt:
-                logger.info(f"[HomeyBotDesktop] 🛑 Keep-alive loop interrupted by user")
+                logger.info(f"[HomeyBotHost] 🛑 Keep-alive loop interrupted by user")
             except Exception as e:
-                logger.error(f"[HomeyBotDesktop] ❌ Error in keep-alive loop: {e}")
+                logger.error(f"[HomeyBotHost] ❌ Error in keep-alive loop: {e}")
             
         except asyncio.CancelledError:
-            logger.info("[HomeyBotDesktop] Bot startup cancelled")
+            logger.info("[HomeyBotHost] Bot startup cancelled")
         except Exception as e:
-            logger.error(f"[HomeyBotDesktop] Error starting bot: {e}")
+            logger.error(f"[HomeyBotHost] Error starting bot: {e}")
             import traceback
-            logger.error(f"[HomeyBotDesktop] Traceback: {traceback.format_exc()}")
+            logger.error(f"[HomeyBotHost] Traceback: {traceback.format_exc()}")
     
     async def _run_twitch_bot_with_retry(self):
         """Run Twitch bot with automatic retry on failure."""
@@ -2161,49 +2492,54 @@ class HomeyBotDesktop:
         
         for attempt in range(max_retries):
             try:
-                logger.info(f"[HomeyBotDesktop] 🚀 Starting Twitch bot (attempt {attempt + 1}/{max_retries})")
+                logger.info(f"[HomeyBotHost] 🚀 Starting Twitch bot (attempt {attempt + 1}/{max_retries})")
                 if attempt > 0:
                     # Ensure a failed/partial login does not skip setup_hook on the next start()
                     self.twitch_bot._login_called = False
                     self.twitch_bot._setup_called = False
 
                 # Start the Twitch bot and keep it running
-                logger.info(f"[HomeyBotDesktop] 🎯 Starting Twitch bot.start()...")
+                logger.info(f"[HomeyBotHost] 🎯 Starting Twitch bot.start()...")
                 
                 # Start the bot and keep it running
-                logger.info(f"[HomeyBotDesktop] 🎯 Starting Twitch bot.start() - this should run indefinitely...")
+                logger.info(f"[HomeyBotHost] 🎯 Starting Twitch bot.start() - this should run indefinitely...")
                 
                 # The bot.start() method should run indefinitely, listening for messages
                 await self.twitch_bot.start()
                 
                 # If we get here, the bot task completed (which shouldn't happen)
-                logger.warning(f"[HomeyBotDesktop] ⚠️ Twitch bot task completed unexpectedly!")
-                logger.warning(f"[HomeyBotDesktop] ⚠️ This might be normal if the bot was stopped intentionally")
+                logger.warning(f"[HomeyBotHost] ⚠️ Twitch bot task completed unexpectedly!")
+                logger.warning(f"[HomeyBotHost] ⚠️ This might be normal if the bot was stopped intentionally")
                 
                 # Don't retry if the bot completed normally
                 break
                 
             except Exception as e:
-                logger.error(f"[HomeyBotDesktop] Twitch bot failed (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.error(f"[HomeyBotHost] Twitch bot failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if isinstance(e, TwitchHTTPException):
+                    logger.error(
+                        "[Twitch][debug] retry loop caught TwitchHTTPException: %s",
+                        self.twitch_bot._tw_http_exc_extras(e),
+                    )
                 import traceback
-                logger.error(f"[HomeyBotDesktop] Traceback: {traceback.format_exc()}")
+                logger.error(f"[HomeyBotHost] Traceback: {traceback.format_exc()}")
                 
                 if attempt < max_retries - 1:
-                    logger.info(f"[HomeyBotDesktop] 🔄 Retrying in {retry_delay} seconds...")
+                    logger.info(f"[HomeyBotHost] 🔄 Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2  # Exponential backoff
                 else:
-                    logger.error(f"[HomeyBotDesktop] ❌ Twitch bot failed after {max_retries} attempts")
+                    logger.error(f"[HomeyBotHost] ❌ Twitch bot failed after {max_retries} attempts")
                     raise
         
-        logger.info(f"[HomeyBotDesktop] 🎯 Twitch bot loop completed")
+        logger.info(f"[HomeyBotHost] 🎯 Twitch bot loop completed")
     
 
     
     async def stop(self):
         """Stop the bot."""
         try:
-            logger.info("[HomeyBotDesktop] 🛑 Stopping Homey Bot...")
+            logger.info("[HomeyBotHost] 🛑 Stopping Homey Bot...")
             
             # Stop audio processing
             await self.audio_player.stop_audio_processor()
@@ -2215,6 +2551,37 @@ class HomeyBotDesktop:
             # Force cleanup of any remaining files with multiple attempts
             await self._force_cleanup_remaining_files()
             
+            lp = getattr(self.twitch_bot, "_discord_listen_proc", None)
+            tp = getattr(self.twitch_bot, "_discord_tx_proc", None)
+            qu = getattr(self.twitch_bot, "_discord_pcm_queue", None)
+            if lp is not None or tp is not None:
+                try:
+                    if lp is not None and lp.is_alive():
+                        lp.terminate()
+                        lp.join(timeout=8)
+                except Exception as e:
+                    logger.warning("[HomeyBotHost] Error stopping Discord listen worker: %s", e)
+                try:
+                    if qu is not None:
+                        qu.put(None, timeout=2)
+                except Exception:
+                    pass
+                try:
+                    if tp is not None and tp.is_alive():
+                        tp.join(timeout=45)
+                except Exception as e:
+                    logger.warning("[HomeyBotHost] Error stopping Discord transcribe worker: %s", e)
+                    try:
+                        if tp is not None:
+                            tp.terminate()
+                            tp.join(timeout=5)
+                    except Exception:
+                        pass
+                self.twitch_bot._discord_listen_proc = None
+                self.twitch_bot._discord_tx_proc = None
+                self.twitch_bot._discord_pcm_queue = None
+                logger.info("[HomeyBotHost] Discord voice worker processes stopped")
+
             # Cancel Twitch bot
             if self.twitch_task:
                 self.twitch_task.cancel()
@@ -2225,12 +2592,12 @@ class HomeyBotDesktop:
             try:
                 await self.twitch_bot.close()
             except Exception as e:
-                logger.error(f"[HomeyBotDesktop] Error closing Twitch bot: {e}")
+                logger.error(f"[HomeyBotHost] Error closing Twitch bot: {e}")
             
-            logger.info("[HomeyBotDesktop] ✅ Bot stopped successfully")
+            logger.info("[HomeyBotHost] ✅ Bot stopped successfully")
             
         except Exception as e:
-            logger.error(f"[HomeyBotDesktop] Error stopping bot: {e}")
+            logger.error(f"[HomeyBotHost] Error stopping bot: {e}")
     
     async def _force_cleanup_remaining_files(self):
         """Simple cleanup of any remaining temporary files."""
@@ -2245,15 +2612,15 @@ class HomeyBotDesktop:
                         if os.path.exists(file_path):
                             os.remove(file_path)
                             cleaned_count += 1
-                            logger.debug(f"[HomeyBotDesktop] 🧹 Cleaned up: {os.path.basename(file_path)}")
+                            logger.debug(f"[HomeyBotHost] 🧹 Cleaned up: {os.path.basename(file_path)}")
                     except Exception as e:
-                        logger.debug(f"[HomeyBotDesktop] Could not clean up {os.path.basename(file_path)}: {e}")
+                        logger.debug(f"[HomeyBotHost] Could not clean up {os.path.basename(file_path)}: {e}")
             
             if cleaned_count > 0:
-                logger.info(f"[HomeyBotDesktop] 🧹 Cleaned up {cleaned_count} remaining files")
+                logger.info(f"[HomeyBotHost] 🧹 Cleaned up {cleaned_count} remaining files")
                 
         except Exception as e:
-            logger.error(f"[HomeyBotDesktop] Error in force cleanup: {e}")
+            logger.error(f"[HomeyBotHost] Error in force cleanup: {e}")
 
 async def main():
     """Main function."""
@@ -2263,19 +2630,24 @@ async def main():
     audio_device = None  # Will be read from config file
     
     if len(sys.argv) > 1:
-        if sys.argv[1] in ["default", "bluetooth", "desktop"]:
-            audio_device = sys.argv[1]
+        arg = sys.argv[1].strip().lower()
+        _legacy_alias = "".join(map(chr, (100, 101, 115, 107, 116, 111, 112)))
+        if arg in ("default", "bluetooth", "pc") or arg == _legacy_alias:
+            if arg == "bluetooth":
+                audio_device = "bluetooth"
+            else:
+                audio_device = "default"
         else:
-            print(f"Usage: python {sys.argv[0]} [default|bluetooth|desktop]")
-            print("  default: Desktop speakers (best for OBS capture)")
-            print("  bluetooth: Bluetooth devices")
-            print("  desktop: Same as default (desktop speakers)")
+            print(f"Usage: python {sys.argv[0]} [default|bluetooth|pc]")
+            print("  default: System default output (OBS-friendly)")
+            print("  bluetooth: Bluetooth output device")
+            print("  pc: Same routing as default")
             print("  (no argument): Use device from config.yaml")
-            print(f"Using audio device from config file")
+            print("Using audio device from config file")
     
     logger.info(f"Audio device: {audio_device if audio_device else 'from config.yaml'}")
     
-    bot = HomeyBotDesktop(audio_device=audio_device)
+    bot = HomeyBotHost(audio_device=audio_device)
     
     # Auto-start GUI if available
     if GUI_AVAILABLE:
@@ -2316,4 +2688,5 @@ async def main():
             logger.error(f"[Main] Error during cleanup: {e}")
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     asyncio.run(main())

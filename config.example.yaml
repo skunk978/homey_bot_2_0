@@ -1,4 +1,5 @@
-# Copy this file to config.yaml and fill in your values (config.yaml is gitignored).
+# Copy this file to config.yaml and fill in your values.
+# NOTE: config.yaml is gitignored because it contains secrets.
 
 twitch:
   bot_token: "oauth:YOUR_BOT_USER_ACCESS_TOKEN"
@@ -8,7 +9,6 @@ twitch:
   channel: "your_channel_login"
   bot_username: "your_bot_login"
   bot_id: "123456789"
-  broadcaster_user_id: ""
   always_read_chat: true
   space_lord_enabled: true
 
@@ -20,9 +20,13 @@ discord:
 
 openai:
   api_key: "YOUR_OPENAI_API_KEY"
-  model: "gpt-3.5-turbo"
+  model: "gpt-4o-mini"   # example; choose what you want
   max_tokens: 150
   temperature: 0.7
+  # timeout_seconds: 90
+  # max_retries: 4
+  # tls_verify: true
+  # use_system_ca: true
 
 audio:
   device: "default"
@@ -43,3 +47,14 @@ logging:
   level: "DEBUG"
   format: "%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s"
   date_format: "%Y-%m-%d %H:%M:%S"
+
+discord_voice_transcribe:
+  enabled: true
+  output_channel_id: 0
+  # voice_channel_id: null
+  # chunk_seconds: 6
+  # min_chunk_seconds: 2
+  # whisper_model: whisper-1
+  # language: null
+  # discord_rest_tls_verify: true
+

@@ -1,0 +1,10 @@
+{
+  "include": ["."],
+  "exclude": ["**/node_modules", "**/__pycache__"],
+  "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": "venv",
+  "extraPaths": ["./venv/Lib/site-packages"],
+  "reportMissingModuleSource": "none",
+  "typeCheckingMode": "off"
+}
