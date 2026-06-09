@@ -25,6 +25,13 @@ class HomeyBotGUI:
         # Message history (last 10)
         self.message_history = []
         self.max_history = 10
+
+        # Discord persona / memories breakdown (shown at top of Recent Messages)
+        self.persona_messages: list[str] = []
+        self.memories_messages: list[str] = []
+        self.persona_channel_name: str | None = None
+        self.memories_channel_name: str | None = None
+        self.context_source: str = ""
         
         # Space Lord API history
         self.should_respond_history = []
@@ -97,7 +104,7 @@ class HomeyBotGUI:
         # Message history frame
         history_frame = tk.LabelFrame(
             left_panel,
-            text="📝 Recent Messages (Last 10)",
+            text="📝 Recent Messages — Discord persona/memories + activity",
             font=("Arial", 12, "bold"),
             bg='#2b2b2b',
             fg='#ffffff',
@@ -163,6 +170,21 @@ class HomeyBotGUI:
             bd=2
         )
         stats_button.pack(side="left", padx=5)
+
+        # Local mic mute (for testing Discord VC without LOCAL transcripts)
+        self.local_mic_muted = False
+        self.local_mic_mute_button = tk.Button(
+            button_frame,
+            text="🎤 Local Mic ON",
+            command=self.toggle_local_mic_mute,
+            bg='#44aa44',
+            fg='#ffffff',
+            font=("Arial", 10, "bold"),
+            relief="raised",
+            bd=2,
+            width=18,
+        )
+        self.local_mic_mute_button.pack(side="left", padx=5)
         
         # Footer
         footer_label = tk.Label(
@@ -224,10 +246,10 @@ class HomeyBotGUI:
         )
         self.generate_response_text.pack(fill="both", expand=True, padx=5, pady=5)
         
-        # Voice Listener frame
+        # Live feed frame (Discord transcripts + Twitch chat + optional local voice)
         voice_listener_frame = tk.LabelFrame(
             parent,
-            text="🎤 Voice Listener - Wake Word Detection",
+            text="📝 Live Feed - Discord / Twitch",
             font=("Arial", 11, "bold"),
             bg='#2b2b2b',
             fg='#ff44aa',
@@ -236,7 +258,7 @@ class HomeyBotGUI:
         )
         voice_listener_frame.pack(fill="both", expand=True, padx=5, pady=5)
         
-        # Voice Listener text area
+        # Live feed text area
         self.voice_listener_text = scrolledtext.ScrolledText(
             voice_listener_frame,
             height=6,
@@ -278,7 +300,7 @@ class HomeyBotGUI:
             self.add_should_respond_api_message(message)
         elif message_type == "GENERATE_RESPONSE_API":
             self.add_generate_response_api_message(message)
-        elif message_type == "VOICE_LISTENER":
+        elif message_type in ("VOICE_LISTENER", "TRANSCRIPT"):
             self.add_voice_listener_message(message)
     
     def add_should_respond_api_message(self, message: str):
@@ -306,7 +328,7 @@ class HomeyBotGUI:
             self.generate_response_text.insert(tk.END, '\n'.join(lines[-20:]) + '\n')
     
     def add_voice_listener_message(self, message: str):
-        """Add a voice listener message to the display."""
+        """Add a live-feed message to the Discord/Twitch transcript display."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.voice_listener_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.voice_listener_text.see(tk.END)
@@ -317,10 +339,65 @@ class HomeyBotGUI:
             self.voice_listener_text.delete(1.0, tk.END)
             self.voice_listener_text.insert(tk.END, '\n'.join(lines[-15:]) + '\n')
     
+    def set_discord_persona_memories(
+        self,
+        persona_messages: list[str],
+        memories_messages: list[str],
+        *,
+        persona_channel: str | None = None,
+        memories_channel: str | None = None,
+        source: str = "Discord",
+    ) -> None:
+        """Pin full persona + memories breakdown at top of Recent Messages panel."""
+        self.persona_messages = [str(m).strip() for m in persona_messages if str(m).strip()]
+        self.memories_messages = [str(m).strip() for m in memories_messages if str(m).strip()]
+        self.persona_channel_name = persona_channel
+        self.memories_channel_name = memories_channel
+        self.context_source = source
+        self.update_history_display()
+
+    def _format_context_breakdown(self) -> str:
+        """Build full persona + memories breakdown for the Recent Messages window."""
+        lines: list[str] = []
+        src = self.context_source or "Discord"
+        lines.append("=" * 58)
+        lines.append(f"📖 PERSONA ({src})")
+        ch = self.persona_channel_name or "persona channel"
+        lines.append(f"   Channel: #{ch}  |  {len(self.persona_messages)} message(s)")
+        lines.append("=" * 58)
+        if not self.persona_messages:
+            lines.append("   (none loaded)")
+        else:
+            for i, msg in enumerate(self.persona_messages, 1):
+                lines.append("")
+                lines.append(f"--- Persona [{i}/{len(self.persona_messages)}] ({len(msg)} chars) ---")
+                lines.append(msg)
+        lines.append("")
+        lines.append("=" * 58)
+        lines.append(f"🧠 MEMORIES ({src})")
+        mch = self.memories_channel_name or "memories channel"
+        lines.append(f"   Channel: #{mch}  |  {len(self.memories_messages)} message(s)")
+        lines.append("=" * 58)
+        if not self.memories_messages:
+            lines.append("   (none loaded)")
+        else:
+            for i, msg in enumerate(self.memories_messages, 1):
+                lines.append("")
+                lines.append(f"--- Memory [{i}/{len(self.memories_messages)}] ({len(msg)} chars) ---")
+                lines.append(msg)
+        lines.append("")
+        lines.append("-" * 58)
+        lines.append(f"📝 RECENT ACTIVITY (last {self.max_history})")
+        lines.append("-" * 58)
+        return "\n".join(lines) + "\n"
+
     def update_history_display(self):
         """Update the history text area."""
         self.history_text.delete(1.0, tk.END)
-        
+        self.history_text.insert(tk.END, self._format_context_breakdown())
+        self.history_text.tag_add("context_header", "1.0", "8.0")
+        self.history_text.tag_config("context_header", foreground="#88ccff")
+
         for entry in reversed(self.message_history):  # Show newest first
             timestamp = entry['timestamp']
             message = entry['message']
@@ -366,6 +443,27 @@ class HomeyBotGUI:
         self.current_message_var.set("History cleared")
         self.status_var.set("🟡 Idle")
         self.update_history_display()
+
+    def toggle_local_mic_mute(self):
+        """Mute/unmute LOCAL mic capture (Discord VC transcribe keeps running)."""
+        from local_mic_control import set_local_mic_muted, is_local_mic_muted
+
+        self.local_mic_muted = set_local_mic_muted(not is_local_mic_muted())
+        if self.local_mic_muted:
+            self.local_mic_mute_button.config(
+                text="🔇 Local Mic MUTED",
+                bg="#ff8800",
+            )
+            self.add_message(
+                "Local mic muted — only Discord VC / Twitch in Live Feed",
+                "INFO",
+            )
+        else:
+            self.local_mic_mute_button.config(
+                text="🎤 Local Mic ON",
+                bg="#44aa44",
+            )
+            self.add_message("Local mic unmuted — LOCAL transcripts enabled", "INFO")
     
     def refresh_display(self):
         """Refresh the display."""
@@ -420,7 +518,9 @@ Last Updated: {datetime.now().strftime("%H:%M:%S")}"""
                     # Check for new messages
                     try:
                         message_data = self.message_queue.get_nowait()
-                        self.add_message(message_data['message'], message_data['type'])
+                        msg = message_data["message"]
+                        mtype = message_data["type"]
+                        self.root.after(0, lambda m=msg, t=mtype: self.add_message(m, t))
                     except queue.Empty:
                         pass
                     
@@ -472,6 +572,33 @@ def add_gui_message(message: str, message_type: str = "TTS"):
             'message': message,
             'type': message_type
         })
+
+
+def set_discord_persona_memories_breakdown(
+    persona_messages: list[str],
+    memories_messages: list[str],
+    *,
+    persona_channel: str | None = None,
+    memories_channel: str | None = None,
+    source: str = "Discord",
+) -> None:
+    """Thread-safe: show all Discord persona/memory messages in Recent Messages panel."""
+    if not gui_instance:
+        return
+
+    def apply() -> None:
+        gui_instance.set_discord_persona_memories(
+            persona_messages,
+            memories_messages,
+            persona_channel=persona_channel,
+            memories_channel=memories_channel,
+            source=source,
+        )
+
+    try:
+        gui_instance.root.after(0, apply)
+    except Exception:
+        apply()
 
 if __name__ == "__main__":
     # Test the GUI

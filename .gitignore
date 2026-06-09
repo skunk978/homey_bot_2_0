@@ -53,3 +53,8 @@ Thumbs.db
 # Temp TTS/audio artifacts
 temp_tts_*.wav
 temp_tts_*.mp3
+temp_discord_speak_*.wav
+
+# Bot runtime locks
+.homey_bot.pid
+.homey_bot.startup.lock

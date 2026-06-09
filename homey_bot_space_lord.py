@@ -6,12 +6,13 @@ This bot reads Twitch chat messages and speaks them aloud using Windows TTS with
 No Discord dependency - direct audio output that can be captured by OBS.
 
 AUDIO OUTPUT OPTIONS:
-- "default": Outputs to desktop speakers (best for OBS capture)
-- "bluetooth": Outputs to Bluetooth devices
-- Specific device name: Outputs to specific audio device
+- "default" / "pc" / "auto": Windows default playback (best when one config is used on multiple PCs).
+- "bluetooth": Only when audio.device is exactly this word — first PyAudio output whose name contains bluetooth/bt on that machine (not inferred from a headset model name).
+- Specific device name: PyAudio device substring; names differ per machine.
 
-For OBS streaming: Use "default" audio device to output to desktop speakers
-For Bluetooth listening: Use "bluetooth" or specific Bluetooth device name
+Prefer default/pc when hardware changes between computers. Optional: env HOMEY_AUDIO_DEVICE, HOMEY_USE_DEFAULT_AUDIO=1, or audio.use_windows_default_output: true in config.
+
+For OBS: default output is usually easiest to capture.
 
 TTS: Windows TTS with automatic female voice detection
 """
@@ -20,8 +21,11 @@ import asyncio
 import logging
 import multiprocessing
 import os
-from typing import Any
+from pathlib import Path
+import re
 import time
+from collections import deque
+from typing import Any
 import yaml
 import subprocess
 import twitchio
@@ -51,8 +55,95 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+from discord_voice_common import (
+    apply_discord_token_env_override,
+    install_ascii_console_logging,
+    parse_discord_vc_skip_sets,
+)
+
+install_ascii_console_logging()
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_runtime_logging_prefs(cfg: dict) -> None:
+    """Align root/third-party verbosity with ``logging.*`` (after YAML is loaded)."""
+    log_sec = cfg.get("logging") or {}
+    level_name = str(log_sec.get("level") or "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.getLogger().setLevel(level)
+    if bool(log_sec.get("quiet_third_party", True)):
+        for name in (
+            "httpx",
+            "httpcore",
+            "httpcore.connection",
+            "httpcore.http11",
+            "urllib3.connectionpool",
+            "discord.http",
+            "discord.gateway",
+        ):
+            logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _affirmative_yes_no(text: str) -> bool:
+    """True if the model's first token is clearly yes (handles 'yes' / 'yes.' / 'yes, because...')."""
+    raw = (text or "").strip().lower()
+    if not raw:
+        return False
+    first_line = raw.split("\n", 1)[0].strip()
+    if not first_line:
+        return False
+    first = first_line.split()[0].strip(".,!?;:\"'")
+    if first == "yes" or first.startswith("yes,"):
+        return True
+    if first == "no" or first.startswith("no,"):
+        return False
+    # Single-line answers like "absolutely" — treat as no unless explicit yes
+    return first_line.startswith("yes ") or first_line == "y"
+
+
+def _distinctive_audio_device_tokens(label: str) -> list[str]:
+    """Tokens like 'b350' that identify a headset model; excludes generic words ('headphones', etc.)."""
+    lower = (label or "").lower()
+    raw = re.findall(r"[a-z0-9]{4,}", lower)
+    generic = frozenset(
+        {
+            "headphone",
+            "headphones",
+            "headset",
+            "speaker",
+            "speakers",
+            "realtek",
+            "audio",
+            "output",
+            "input",
+            "default",
+            "primary",
+            "sound",
+            "mapper",
+            "device",
+            "vb",
+            "virtual",
+            "cable",
+            "voicemeeter",
+            "hands",
+            "microsoft",
+            "point",
+            "line",
+            "voicemod",
+        }
+    )
+    out: list[str] = []
+    for t in raw:
+        if t in generic or t in out:
+            continue
+        out.append(t)
+    return out
+
+
+from discord_voice_common import discord_snowflake_id as _discord_snowflake_id
+from discord_voice_common import log_discord_guild_hint as _log_discord_guild_hint
+from discord_voice_common import resolve_discord_channel as _resolve_discord_channel
 
 
 def _log_space_lord_openai_error(context: str, exc: BaseException) -> None:
@@ -152,7 +243,7 @@ except ImportError:
 
 # Try to import GUI module
 try:
-    from gui_monitor import add_gui_message, start_gui
+    from gui_monitor import add_gui_message, set_discord_persona_memories_breakdown, start_gui
     GUI_AVAILABLE = True
     logger.info("[GUI] ✅ GUI module loaded successfully")
 except ImportError:
@@ -164,7 +255,7 @@ except ImportError:
 class DesktopAudioPlayer:
     """Handles desktop audio output for TTS messages - can output to any audio device including Bluetooth."""
     
-    def __init__(self, audio_device="default"):
+    def __init__(self, audio_device="default", *, verbose_device_list: bool = False):
         self.audio_queue = asyncio.Queue(maxsize=20)
         self.is_playing = False
         self.audio_task = None
@@ -176,6 +267,7 @@ class DesktopAudioPlayer:
         self.pyaudio_instance = None
         self.audio_stream = None
         self.device_index = None
+        self.verbose_device_list = verbose_device_list
         
         # For OBS capture: use "default" to output to desktop speakers
         # For Bluetooth: use "bluetooth" or specific Bluetooth device name
@@ -209,17 +301,88 @@ class DesktopAudioPlayer:
                 self.device_index,
                 self.audio_device,
             )
+            # Pygame fallback must be ready when PyAudio open/write fails (-9999, exclusive mode, etc.).
+            self._ensure_pygame_mixer(optional=True)
             
         except Exception as e:
             logger.error(f"[DesktopAudio] ❌ Failed to initialize PyAudio: {e}")
-            # Fallback to pygame if PyAudio fails
+            if not self._ensure_pygame_mixer(optional=False):
+                raise RuntimeError("PyAudio failed and pygame mixer could not be initialized") from e
+            logger.info("[DesktopAudio] Using pygame-only audio (PyAudio unavailable)")
+    
+    def _ensure_pygame_mixer(self, *, optional: bool = False) -> bool:
+        """Initialize pygame.mixer for WAV fallback (idempotent)."""
+        def _init_mixer() -> bool:
+            if pygame.mixer.get_init() is not None:
+                try:
+                    pygame.mixer.music.set_volume(self.volume)
+                except Exception:
+                    pass
+                return True
+            pygame.mixer.init(
+                frequency=self.sample_rate,
+                size=-16,
+                channels=self.channels,
+                buffer=4096,
+            )
+            pygame.mixer.music.set_volume(self.volume)
+            logger.info("[DesktopAudio] pygame mixer ready (WAV fallback)")
+            return True
+
+        try:
+            return _init_mixer()
+        except Exception as e_first:
+            if optional:
+                logger.debug("[DesktopAudio] pygame mixer optional init skipped: %s", e_first)
+                return False
+            msg_l = str(e_first).lower()
+            maybe_wasapi = os.name == "nt" and (
+                "wasapi" in msg_l
+                or "audio client" in msg_l
+                or "can't initialize" in msg_l
+                or "can't initialise" in msg_l
+            )
+            if maybe_wasapi:
+                logger.warning(
+                    "[DesktopAudio] pygame WASAPI init failed (%s); retrying with SDL_AUDIODRIVER=directsound",
+                    e_first,
+                )
+                try:
+                    try:
+                        pygame.mixer.quit()
+                    except Exception:
+                        pass
+                    os.environ["SDL_AUDIODRIVER"] = "directsound"
+                    ok = _init_mixer()
+                    if ok:
+                        logger.info("[DesktopAudio] pygame mixer OK via DirectSound fallback")
+                    return ok
+                except Exception as e2:
+                    logger.error("[DesktopAudio] pygame DirectSound retry failed: %s", e2)
+                    return False
+            logger.error("[DesktopAudio] pygame mixer init failed: %s", e_first)
+            return False
+
+    def _output_device_indices_fallback(self, *, skip_indices: frozenset[int]) -> list[int]:
+        """Other PyAudio hosts with >=1 output channel (helps when default device returns -9985)."""
+        if not self.pyaudio_instance:
+            return []
+        out: list[int] = []
+        try:
+            count = self.pyaudio_instance.get_device_count()
+        except Exception:
+            return []
+        for i in range(count):
+            if i in skip_indices:
+                continue
             try:
-                pygame.mixer.init(frequency=self.sample_rate, size=-16, channels=self.channels)
-                pygame.mixer.music.set_volume(self.volume)
-                logger.info(f"[DesktopAudio] ✅ Fallback to pygame mixer initialized")
-            except Exception as pygame_error:
-                logger.error(f"[DesktopAudio] ❌ Both PyAudio and pygame failed: {pygame_error}")
-                raise
+                inf = self.pyaudio_instance.get_device_info_by_index(i)
+            except Exception:
+                continue
+            if int(inf.get("maxOutputChannels", 0) or 0) < 1:
+                continue
+            out.append(i)
+        return out[:40]
     
     def _find_audio_device(self):
         """Find the appropriate audio device index based on the device name."""
@@ -230,16 +393,22 @@ class DesktopAudioPlayer:
             
             # Get list of all audio devices
             device_count = self.pyaudio_instance.get_device_count()
-            logger.info(f"[DesktopAudio] 🔍 Found {device_count} audio devices")
-            
-            # List all available devices for debugging
-            logger.info(f"[DesktopAudio] 🔍 Available audio devices:")
-            for i in range(device_count):
-                device_info = self.pyaudio_instance.get_device_info_by_index(i)
-                device_name = device_info.get('name', 'Unknown')
-                max_output_channels = device_info.get('maxOutputChannels', 0)
-                if max_output_channels > 0:  # Only show output devices
-                    logger.info(f"[DesktopAudio]   {i}: {device_name} (output channels: {max_output_channels})")
+            if self.verbose_device_list:
+                logger.info(f"[DesktopAudio] 🔍 Found {device_count} audio devices")
+                logger.info("[DesktopAudio] 🔍 Available audio devices:")
+                for i in range(device_count):
+                    device_info = self.pyaudio_instance.get_device_info_by_index(i)
+                    device_name = device_info.get('name', 'Unknown')
+                    max_output_channels = device_info.get('maxOutputChannels', 0)
+                    if max_output_channels > 0:
+                        logger.info(
+                            "[DesktopAudio]   %s: %s (output channels: %s)",
+                            i,
+                            device_name,
+                            max_output_channels,
+                        )
+            else:
+                logger.info("[DesktopAudio] Device list suppressed (logging.list_audio_devices_verbose: false)")
             
             # Handle different device selection modes ('pc' and legacy chr-built alias match default routing)
             _mode = (self.audio_device or "").strip().lower()
@@ -252,7 +421,7 @@ class DesktopAudioPlayer:
                 return device_index
             
             elif _mode == "bluetooth":
-                # Look for Bluetooth devices
+                # Explicit opt-in only (audio.device must be the word "bluetooth"); not auto from headset names.
                 bluetooth_devices = []
                 for i in range(device_count):
                     device_info = self.pyaudio_instance.get_device_info_by_index(i)
@@ -293,6 +462,19 @@ class DesktopAudioPlayer:
                             device_name_lower in target_device_lower or
                             any(part in device_name_lower for part in target_device_lower.split() if len(part) > 3)):
                             candidates.append((i, device_name, device_name_lower))
+                
+                # Prefer devices that match model-specific tokens (e.g. "b350") so we do not
+                # route "Headphones (B350-XT...)" to unrelated "Headphones 1 (Realtek...)".
+                tags = _distinctive_audio_device_tokens(self.audio_device)
+                if tags and candidates:
+                    tagged = [c for c in candidates if any(t in c[2] for t in tags)]
+                    if tagged:
+                        candidates = tagged
+                        logger.info(
+                            "[DesktopAudio] Matched distinctive token(s) %s; candidate count=%s",
+                            tags,
+                            len(tagged),
+                        )
                 
                 # Prioritize "Headphones" over "Headset" for Bluetooth devices
                 if candidates:
@@ -449,56 +631,81 @@ class DesktopAudioPlayer:
                 add_gui_message(f"❌ Audio playback error: {str(e)[:50]}", "ERROR")
     
     async def _play_with_pyaudio(self, audio_file: str) -> bool:
-        """Play audio using PyAudio with specific device selection."""
-        try:
-            # Open the audio file
-            with wave.open(audio_file, 'rb') as wf:
-                # Get audio file parameters
-                file_sample_rate = wf.getframerate()
-                file_channels = wf.getnchannels()
-                file_sample_width = wf.getsampwidth()
-                
-                # Log which device we're using
-                if self.device_index is not None:
-                    device_info = self.pyaudio_instance.get_device_info_by_index(self.device_index)
-                    device_name = device_info.get('name', 'Unknown')
-                    logger.info(f"[DesktopAudio] 🎯 Playing audio on device: {device_name}")
-                else:
-                    logger.info(f"[DesktopAudio] 🎯 Playing audio on default device")
-                
-                # Open PyAudio stream with the selected device
-                stream = self.pyaudio_instance.open(
-                    format=self.pyaudio_instance.get_format_from_width(file_sample_width),
-                    channels=file_channels,
-                    rate=file_sample_rate,
-                    output=True,
-                    output_device_index=self.device_index
-                )
-                
-                # Read and play audio data
-                chunk_size = 1024
-                data = wf.readframes(chunk_size)
-                
-                while data:
-                    stream.write(data)
-                    data = wf.readframes(chunk_size)
-                    await asyncio.sleep(0.01)  # Small delay to prevent blocking
-                
-                # Clean up
-                stream.stop_stream()
-                stream.close()
-                
-                logger.info(f"[DesktopAudio] ✅ PyAudio playback completed: {audio_file}")
-                return True
-                
-        except Exception as e:
-            logger.error(f"[DesktopAudio] ❌ PyAudio playback error: {e}")
+        """Play audio using PyAudio; retry default and other output hosts if the device errors (-9985/-9999)."""
+        if not self.pyaudio_instance:
             return False
+
+        primary: list[int] = []
+        if self.device_index is not None:
+            primary.append(int(self.device_index))
+        try:
+            default_idx = int(self.pyaudio_instance.get_default_output_device_info()["index"])
+            if default_idx not in primary:
+                primary.append(default_idx)
+        except Exception:
+            pass
+
+        skip = frozenset(primary)
+        fallback = self._output_device_indices_fallback(skip_indices=skip)
+        try_orders: list[int] = []
+        seen: set[int] = set()
+        for idx in primary + fallback:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            try_orders.append(idx)
+
+        last_err: BaseException | None = None
+        for idx in try_orders:
+            try:
+                with wave.open(audio_file, "rb") as wf:
+                    file_sample_rate = wf.getframerate()
+                    file_channels = wf.getnchannels()
+                    file_sample_width = wf.getsampwidth()
+                    try:
+                        device_info = self.pyaudio_instance.get_device_info_by_index(idx)
+                        device_name = device_info.get("name", "Unknown")
+                    except Exception:
+                        device_name = f"index {idx}"
+                    logger.debug("[DesktopAudio] PyAudio output try device_index=%s (%s)", idx, device_name)
+
+                    stream = self.pyaudio_instance.open(
+                        format=self.pyaudio_instance.get_format_from_width(file_sample_width),
+                        channels=file_channels,
+                        rate=file_sample_rate,
+                        output=True,
+                        output_device_index=idx,
+                    )
+                    chunk_size = 1024
+                    data = wf.readframes(chunk_size)
+                    while data:
+                        stream.write(data)
+                        data = wf.readframes(chunk_size)
+                        await asyncio.sleep(0.01)
+                    stream.stop_stream()
+                    stream.close()
+                logger.info(
+                    "[DesktopAudio] PyAudio playback completed: %s (device=%s)",
+                    audio_file,
+                    device_name,
+                )
+                return True
+            except Exception as e:
+                last_err = e
+                logger.debug(
+                    "[DesktopAudio] PyAudio playback failed on device_index=%s: %s",
+                    idx,
+                    e,
+                )
+        if last_err is not None:
+            logger.error("[DesktopAudio] PyAudio playback error (all attempts): %s", last_err)
+        return False
     
     async def _play_with_pygame(self, audio_file: str):
         """Fallback audio playback using pygame."""
         try:
-            # Load and play the audio file
+            if not self._ensure_pygame_mixer(optional=False):
+                raise RuntimeError("pygame mixer could not be initialized for WAV playback")
             pygame.mixer.music.load(audio_file)
             pygame.mixer.music.set_volume(self.volume)
             pygame.mixer.music.play()
@@ -843,6 +1050,8 @@ class SpaceLord:
         self.persona = self._load_persona()  # Load default first
         self.memories = []
         self.max_memories = 50
+        # Rolling chat lines for LLM context only (not Discord permanent memory).
+        self.recent_chat: deque[str] = deque(maxlen=40)
         self.last_response_time = 0
         self.response_cooldown = 30  # seconds between responses
         
@@ -855,36 +1064,195 @@ class SpaceLord:
         self.voice_listener = None
         self.is_listening = False
         self.wake_words = ["hey mudflap", "hey space lord", "hey space lord", "mudflap", "space lord"]
-    
+
+    def _verbose_space_lord_api_log(self) -> bool:
+        lg = self.config.get("logging") or {}
+        dbg = self.config.get("debug") or {}
+        return bool(lg.get("verbose_space_lord_api_log")) or bool(dbg.get("enabled"))
+
+    def _append_recent_chat(self, username: str, message: str) -> None:
+        """Append a chat line for short-term context in prompts (not permanent memory)."""
+        self.recent_chat.append(f"{username}: {message}")
+
+    def _recent_chat_context(self, limit: int = 12) -> str:
+        lines = list(self.recent_chat)
+        if not lines:
+            return "(no recent lines yet)"
+        return "\n".join(lines[-limit:])
+
     async def initialize_discord_persona(self):
         """Initialize Space Lord's persona and memories from Discord channels."""
         try:
             logger.info("[SpaceLord] 🔄 Initializing persona and memories from Discord...")
-            
-            # Fetch persona
-            discord_persona = await self._fetch_persona_from_discord()
+            (
+                discord_persona,
+                discord_memories,
+                persona_msgs,
+                memories_msgs,
+                persona_ch,
+                memories_ch,
+            ) = await self._fetch_persona_and_memories_one_gateway()
+
             if discord_persona:
                 self.persona = discord_persona
                 self.discord_persona_loaded = True
                 logger.info("[SpaceLord] ✅ Persona loaded from Discord successfully")
-                # Save to local file for backup
                 self._save_persona(discord_persona)
             else:
                 logger.warning("[SpaceLord] ⚠️ Could not load persona from Discord, using local persona")
-            
-            # Fetch memories
-            discord_memories = await self._fetch_memories_from_discord()
+                persona_msgs = self._persona_messages_from_local()
+                persona_ch = "space_lord_persona.txt"
+
             if discord_memories:
                 self.discord_memories = discord_memories
                 self.discord_memories_loaded = True
                 logger.info("[SpaceLord] ✅ Memories loaded from Discord successfully")
             else:
                 logger.warning("[SpaceLord] ⚠️ Could not load memories from Discord, using local memories")
-            
+                memories_msgs = self._memories_messages_from_local()
+                memories_ch = "space_lord_memories.txt"
+
+            if GUI_AVAILABLE:
+                try:
+                    set_discord_persona_memories_breakdown(
+                        persona_msgs,
+                        memories_msgs,
+                        persona_channel=persona_ch,
+                        memories_channel=memories_ch,
+                        source="Discord" if (discord_persona or discord_memories) else "local file",
+                    )
+                except Exception as gui_err:
+                    logger.warning(
+                        "[SpaceLord] Could not update GUI persona/memories panel: %s", gui_err
+                    )
+
         except Exception as e:
             logger.error(f"[SpaceLord] ❌ Error initializing Discord persona/memories: {e}")
             logger.info("[SpaceLord] ℹ️ Using local persona and memories as fallback")
-        
+            if GUI_AVAILABLE:
+                try:
+                    set_discord_persona_memories_breakdown(
+                        self._persona_messages_from_local(),
+                        self._memories_messages_from_local(),
+                        persona_channel="space_lord_persona.txt",
+                        memories_channel="space_lord_memories.txt",
+                        source="local file (fallback)",
+                    )
+                except Exception:
+                    pass
+
+    def _persona_messages_from_local(self) -> list[str]:
+        text = (self.persona or self._load_persona() or "").strip()
+        if not text:
+            return []
+        parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+        return parts if parts else [text]
+
+    def _memories_messages_from_local(self) -> list[str]:
+        try:
+            if os.path.exists("space_lord_memories.txt"):
+                with open("space_lord_memories.txt", encoding="utf-8") as f:
+                    text = f.read().strip()
+            else:
+                text = ""
+        except Exception:
+            text = ""
+        if not text:
+            return []
+        parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+        return parts if parts else [text]
+
+    async def _fetch_persona_and_memories_one_gateway(
+        self,
+    ) -> tuple[str | None, str | None, list[str], list[str], str | None, str | None]:
+        """One Discord gateway login for persona + memories (avoids invalidating the next voice session)."""
+        if not self.config.get("discord", {}).get("bot_token"):
+            logger.warning("[SpaceLord] ⚠️ No Discord bot token configured, using local persona/memories")
+            return None, None, [], [], None, None
+
+        persona_messages: list[str] = []
+        memories_messages: list[str] = []
+        persona_channel_name: str | None = None
+        memories_channel_name: str | None = None
+        token = self.config["discord"]["bot_token"]
+
+        intents = discord.Intents.default()
+        intents.message_content = True
+        client = discord.Client(intents=intents)
+
+        @client.event
+        async def on_ready():
+            try:
+                logger.info(
+                    "[SpaceLord] 🔗 Connected to Discord as %s (single session: persona + memories)",
+                    client.user,
+                )
+                dconf = self.config.get("discord") or {}
+                _log_discord_guild_hint(client, dconf.get("guild_id"))
+                persona_id = dconf.get("persona_channel_id")
+                mem_id = dconf.get("memories_channel_id")
+
+                pch = await _resolve_discord_channel(client, persona_id) if persona_id else None
+                if pch:
+                    persona_channel_name = str(pch.name)
+                    logger.info("[SpaceLord] 📖 Fetching persona from Discord channel: %s", pch.name)
+                    async for message in pch.history(limit=50):
+                        if message.content.strip():
+                            persona_messages.append(message.content)
+                    persona_messages.reverse()
+                    logger.info("[SpaceLord] ✅ Fetched %s persona messages from Discord", len(persona_messages))
+                else:
+                    logger.error(
+                        "[SpaceLord] ❌ Could not resolve Discord persona channel %s "
+                        "(bot must be in the server and able to see the channel)",
+                        persona_id,
+                    )
+
+                mch = await _resolve_discord_channel(client, mem_id) if mem_id else None
+                if mch:
+                    memories_channel_name = str(mch.name)
+                    logger.info("[SpaceLord] 📖 Fetching memories from Discord channel: %s", mch.name)
+                    async for message in mch.history(limit=100):
+                        if message.content.strip():
+                            memories_messages.append(message.content)
+                    memories_messages.reverse()
+                    logger.info("[SpaceLord] ✅ Fetched %s memory messages from Discord", len(memories_messages))
+                else:
+                    logger.error(
+                        "[SpaceLord] ❌ Could not resolve Discord memories channel %s "
+                        "(bot must be in the server and able to see the channel)",
+                        mem_id,
+                    )
+            except Exception as e:
+                logger.error("[SpaceLord] ❌ Error in single-session Discord fetch: %s", e)
+            finally:
+                await client.close()
+
+        try:
+            await client.start(token)
+        except Exception as e:
+            logger.error("[SpaceLord] ❌ Error starting Discord client for bootstrap: %s", e)
+            return None, None, [], [], None, None
+
+        combined_p = "\n\n".join(persona_messages) if persona_messages else None
+        combined_m = "\n\n".join(memories_messages) if memories_messages else None
+        if combined_p:
+            logger.info("[SpaceLord] 📝 Combined persona from Discord: %s characters", len(combined_p))
+        else:
+            logger.warning("[SpaceLord] ⚠️ No persona content found in Discord channel")
+        if combined_m:
+            logger.info("[SpaceLord] 📝 Combined memories from Discord: %s characters", len(combined_m))
+        else:
+            logger.warning("[SpaceLord] ⚠️ No memory content found in Discord channel")
+        return (
+            combined_p,
+            combined_m,
+            persona_messages,
+            memories_messages,
+            persona_channel_name,
+            memories_channel_name,
+        )
+
     def _load_persona(self):
         """Load Space Lord's persona from file or use default."""
         try:
@@ -897,126 +1265,6 @@ class SpaceLord:
         except Exception as e:
             logger.error(f"[SpaceLord] Error loading persona: {e}")
             return "You are Space Lord, a charismatic space explorer."
-    
-    async def _fetch_persona_from_discord(self):
-        """Fetch Space Lord's persona from Discord channel."""
-        try:
-            if not self.config.get('discord', {}).get('bot_token'):
-                logger.warning("[SpaceLord] ⚠️ No Discord bot token configured, using local persona")
-                return None
-            
-            # Create Discord client
-            intents = discord.Intents.default()
-            intents.message_content = True
-            client = discord.Client(intents=intents)
-            
-            persona_content = []
-            
-            @client.event
-            async def on_ready():
-                try:
-                    logger.info(f"[SpaceLord] 🔗 Connected to Discord as {client.user}")
-                    
-                    # Get the persona channel
-                    channel_id = self.config['discord']['persona_channel_id']
-                    channel = client.get_channel(channel_id)
-                    
-                    if not channel:
-                        logger.error(f"[SpaceLord] ❌ Could not find Discord channel {channel_id}")
-                        return
-                    
-                    logger.info(f"[SpaceLord] 📖 Fetching persona from Discord channel: {channel.name}")
-                    
-                    # Fetch recent messages from the persona channel
-                    async for message in channel.history(limit=50):
-                        if message.content.strip():
-                            persona_content.append(message.content)
-                    
-                    # Reverse to get chronological order
-                    persona_content.reverse()
-                    
-                    logger.info(f"[SpaceLord] ✅ Fetched {len(persona_content)} persona messages from Discord")
-                    
-                except Exception as e:
-                    logger.error(f"[SpaceLord] ❌ Error fetching persona from Discord: {e}")
-                finally:
-                    await client.close()
-            
-            # Run the Discord client
-            await client.start(self.config['discord']['bot_token'])
-            
-            if persona_content:
-                # Combine all persona messages
-                combined_persona = "\n\n".join(persona_content)
-                logger.info(f"[SpaceLord] 📝 Combined persona from Discord: {len(combined_persona)} characters")
-                return combined_persona
-            else:
-                logger.warning("[SpaceLord] ⚠️ No persona content found in Discord channel")
-                return None
-                
-        except Exception as e:
-            logger.error(f"[SpaceLord] ❌ Error in Discord persona fetch: {e}")
-            return None
-    
-    async def _fetch_memories_from_discord(self):
-        """Fetch Space Lord's memories from Discord channel."""
-        try:
-            if not self.config.get('discord', {}).get('bot_token'):
-                logger.warning("[SpaceLord] ⚠️ No Discord bot token configured, using local memories")
-                return None
-            
-            # Create Discord client
-            intents = discord.Intents.default()
-            intents.message_content = True
-            client = discord.Client(intents=intents)
-            
-            memories_content = []
-            
-            @client.event
-            async def on_ready():
-                try:
-                    logger.info(f"[SpaceLord] 🔗 Connected to Discord for memories as {client.user}")
-                    
-                    # Get the memories channel
-                    channel_id = self.config['discord']['memories_channel_id']
-                    channel = client.get_channel(channel_id)
-                    
-                    if not channel:
-                        logger.error(f"[SpaceLord] ❌ Could not find Discord memories channel {channel_id}")
-                        return
-                    
-                    logger.info(f"[SpaceLord] 📖 Fetching memories from Discord channel: {channel.name}")
-                    
-                    # Fetch recent messages from the memories channel
-                    async for message in channel.history(limit=100):
-                        if message.content.strip():
-                            memories_content.append(message.content)
-                    
-                    # Reverse to get chronological order
-                    memories_content.reverse()
-                    
-                    logger.info(f"[SpaceLord] ✅ Fetched {len(memories_content)} memory messages from Discord")
-                    
-                except Exception as e:
-                    logger.error(f"[SpaceLord] ❌ Error fetching memories from Discord: {e}")
-                finally:
-                    await client.close()
-            
-            # Run the Discord client
-            await client.start(self.config['discord']['bot_token'])
-            
-            if memories_content:
-                # Combine all memory messages
-                combined_memories = "\n\n".join(memories_content)
-                logger.info(f"[SpaceLord] 📝 Combined memories from Discord: {len(combined_memories)} characters")
-                return combined_memories
-            else:
-                logger.warning("[SpaceLord] ⚠️ No memory content found in Discord channel")
-                return None
-                
-        except Exception as e:
-            logger.error(f"[SpaceLord] ❌ Error in Discord memories fetch: {e}")
-            return None
     
     async def add_memory_to_discord(self, memory_content: str):
         """Add a memory to Space Lord's Discord memories channel."""
@@ -1039,12 +1287,16 @@ class SpaceLord:
                     
                     # Get the memories channel
                     channel_id = self.config['discord']['memories_channel_id']
-                    channel = client.get_channel(channel_id)
-                    
+                    channel = await _resolve_discord_channel(client, channel_id)
+
                     if not channel:
-                        logger.error(f"[SpaceLord] ❌ Could not find Discord memories channel {channel_id}")
+                        logger.error(
+                            "[SpaceLord] ❌ Could not resolve Discord memories channel %s "
+                            "(bot must be in the server and able to see the channel)",
+                            channel_id,
+                        )
                         return
-                    
+
                     logger.info(f"[SpaceLord] 📝 Adding memory to Discord channel: {channel.name}")
                     
                     # Send the memory to the channel
@@ -1075,30 +1327,35 @@ class SpaceLord:
             if response:
                 context += f"\nSpace Lord's Response: {response}"
             
-            prompt = f"""Decide whether Space Lord should remember this interaction in his permanent memory.
+            prompt = f"""Decide whether this interaction should be stored in Space Lord's PERMANENT long-term memory (Discord).
 
-Space Lord should remember if ANY of these conditions are met:
-1. The interaction reveals important information about the user
-2. The interaction contains valuable knowledge or insights
-3. The interaction establishes a significant relationship or connection
-4. The interaction involves important decisions or commitments
-5. The interaction contains information that could be useful in future conversations
-6. The interaction is emotionally significant or memorable
+Default answer: NO. Memory is rare.
+
+Answer YES only if the message (or Space Lord's reply) contains durable, reference-worthy facts that would help in future streams — for example:
+- Stable facts about a person (job, city, long-term preferences, family/pets they want remembered)
+- Explicit requests like "remember that …" / "don't forget …"
+- Commitments, milestones, or running jokes the streamer asked to track
+
+Answer NO for typical stream chat, including:
+- Greetings, hype, emotes-only, copypasta, LUL/KEKW-only, one-word reactions
+- Generic banter, back-and-forth without new facts
+- Temporary mood ("I'm tired tonight") unless they ask to remember it
+- Commands, bot calls, raids/host without personal facts
+- Anything already obvious or not useful next week
 
 Context:
 {context}
 
-Consider:
-- Is this information worth preserving for future reference?
-- Would this help Space Lord better understand or interact with this user?
-- Is this knowledge that could be valuable in other contexts?
-
-Respond with one word: "yes" or "no"
+Respond with exactly one word on the first line: yes or no
 
 Answer:"""
             
             # Prepare API request
-            system_message = self.persona if self.discord_persona_loaded else "You are Space Lord, an intergalactic overlord and stream moderator. You should remember important interactions and information."
+            system_message = (
+                self.persona
+                if self.discord_persona_loaded
+                else "You are Space Lord. You almost never write to permanent memory; only for clearly important, lasting facts."
+            )
             
             api_messages = [
                 {"role": "system", "content": system_message},
@@ -1109,13 +1366,13 @@ Answer:"""
             response = self.openai_client.chat.completions.create(
                 model=self.config['openai']['model'],
                 messages=api_messages,
-                temperature=0.7,
-                max_tokens=50
+                temperature=0.1,
+                max_tokens=8
             )
             
             # Extract the response
             response_text = response.choices[0].message.content.strip()
-            should_remember = response_text.lower().endswith('yes')
+            should_remember = _affirmative_yes_no(response_text)
             
             logger.info(f"[SpaceLord] 🤔 Memory decision for '{message[:30]}...': {should_remember}")
             
@@ -1130,13 +1387,9 @@ Answer:"""
         try:
             # Extract key information from the interaction
             key_info = await self.extract_key_information(username, message, response)
-            
             if key_info:
                 return key_info
-            else:
-                # Fallback to simple format if extraction fails
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                return f"[{timestamp}] {username}: {message}"
+            return None
             
         except Exception as e:
             logger.error(f"[SpaceLord] Error creating memory entry: {str(e)}")
@@ -1145,38 +1398,39 @@ Answer:"""
     async def extract_key_information(self, username: str, message: str, response: str = None) -> str:
         """Extract key information from an interaction for memory storage."""
         try:
+            ch = str(self.config.get("twitch", {}).get("channel", "chatter")).lstrip("#").strip() or "chatter"
             context = f"User: {username}\nMessage: {message}"
             if response:
                 context += f"\nSpace Lord's Response: {response}"
             
-            prompt = f"""Extract the key information from this interaction that should be remembered.
+            prompt = f"""Extract at most ONE concise fact worth PERMANENT memory for a stream AI (single line, no quotes).
 
-Focus on:
-1. Important facts about the user (name, occupation, location, preferences, etc.)
-2. Significant information shared by the user
-3. Important details that would be useful for future conversations
-4. Key insights or knowledge mentioned
+Include the speaker's Twitch login as a prefix if the fact is about them.
+
+GOOD examples (lasting, specific):
+- "{ch} drives a Freightliner for work"
+- "{ch} lives in Texas"
+- "{ch} asked to remember their dog is named Rover"
+
+DO NOT extract — reply exactly NO_KEY_INFO for:
+- Greetings, hype, emotes, LUL/KEKW, single words, copypasta
+- Opinions with no lasting use ("this game is mid tonight")
+- Generic chat with no new fact about a person or the stream
+- Anything you would not still care about next month
 
 Context:
 {context}
 
-Extract only the essential information in a concise format. 
-If the information is about the speaker (the person who sent the message), include their username as a prefix.
+If nothing qualifies, respond with exactly: NO_KEY_INFO
 
-Examples:
-- "pinnerbob drives a freightliner"
-- "pinnerbob is from Texas"
-- "pinnerbob likes space exploration"
-- "pinnerbob works as a truck driver"
-- "pinnerbob has a dog named rover"
-- "pinnerbob's favorite color is blue"
-
-If no important information is present, respond with "NO_KEY_INFO"
-
-Extracted information:"""
+Otherwise one line only, extracted information:"""
             
             # Prepare API request
-            system_message = self.persona if self.discord_persona_loaded else "You are Space Lord, an intergalactic overlord. Extract only the most important information from interactions."
+            system_message = (
+                self.persona
+                if self.discord_persona_loaded
+                else "You extract rare, durable facts for a stream bot. When in doubt, output NO_KEY_INFO."
+            )
             
             api_messages = [
                 {"role": "system", "content": system_message},
@@ -1187,15 +1441,14 @@ Extracted information:"""
             response = self.openai_client.chat.completions.create(
                 model=self.config['openai']['model'],
                 messages=api_messages,
-                temperature=0.3,
-                max_tokens=100
+                temperature=0.15,
+                max_tokens=80
             )
             
             # Extract the response
             extracted_info = response.choices[0].message.content.strip()
-            
-            # Check if no key info was found
-            if extracted_info.upper() == "NO_KEY_INFO" or not extracted_info:
+            first_tok = (extracted_info.split() or [""])[0].strip().strip('`"\'.,;:!?').upper()
+            if first_tok == "NO_KEY_INFO" or not extracted_info:
                 return None
             
             logger.info(f"[SpaceLord] 📝 Extracted key info: {extracted_info}")
@@ -1240,19 +1493,24 @@ Extracted information:"""
         except Exception as e:
             logger.error(f"[SpaceLord] Error loading memories: {e}")
     
-    async def should_respond(self, username: str, message: str) -> bool:
+    async def should_respond(self, username: str, message: str, *, append_context: bool = True) -> bool:
         """Determine if Space Lord should respond to a message."""
         try:
             # Check cooldown
             current_time = time.time()
             if current_time - self.last_response_time < self.response_cooldown:
+                remaining = self.response_cooldown - (current_time - self.last_response_time)
+                logger.info(
+                    "[Space Lord] should_respond skipped (cooldown %.0fs remaining)",
+                    remaining,
+                )
                 return False
             
-            # Add the message to memories
-            self.add_memory(f"{username}: {message}")
+            if append_context:
+                self._append_recent_chat(username, message)
             
             # Prepare context for OpenAI with Discord memories
-            local_memories = "\n".join(self.memories[-10:])  # Last 10 local memories
+            local_memories = self._recent_chat_context(12)
             discord_memories = self.discord_memories if self.discord_memories_loaded else ""
             
             # Combine local and Discord memories
@@ -1293,26 +1551,34 @@ Answer:"""
                 {"role": "user", "content": prompt}
             ]
             
-            # Log the complete API request
-            logger.info("=" * 80)
-            logger.info("[Space Lord] 🚀 SHOULD_RESPOND API REQUEST:")
-            logger.info("=" * 80)
-            logger.info(f"Model: {self.config['openai']['model']}")
-            logger.info(f"Temperature: 0.7")
-            logger.info(f"Max Tokens: 100")
-            logger.info("")
-            logger.info("📤 MESSAGES SENT TO API:")
-            for i, msg in enumerate(api_messages):
-                logger.info(f"Message {i+1} ({msg['role']}):")
-                logger.info(f"Content: {msg['content']}")
+            # Log compact by default (full prompts at DEBUG when verbose_space_lord_api_log or debug.enabled)
+            if self._verbose_space_lord_api_log():
+                logger.info("=" * 80)
+                logger.info("[Space Lord] 🚀 SHOULD_RESPOND API REQUEST:")
+                logger.info("=" * 80)
+                logger.info(f"Model: {self.config['openai']['model']}")
+                logger.info(f"Temperature: 0.7")
+                logger.info(f"Max Tokens: 100")
                 logger.info("")
-            logger.info("=" * 80)
+                logger.info("📤 MESSAGES SENT TO API:")
+                for i, msg in enumerate(api_messages):
+                    logger.info(f"Message {i+1} ({msg['role']}):")
+                    logger.info(f"Content: {msg['content']}")
+                    logger.info("")
+                logger.info("=" * 80)
+            else:
+                logger.info(
+                    "[Space Lord] should_respond model=%s tokens=100 prompt_chars=%s (full prompt: DEBUG or logging.verbose_space_lord_api_log)",
+                    self.config["openai"]["model"],
+                    sum(len(str(m.get("content", ""))) for m in api_messages),
+                )
             
             # Send to GUI
             gui_message = f"🚀 SHOULD_RESPOND API REQUEST:\nModel: {self.config['openai']['model']}\nTemperature: 0.7\nMax Tokens: 100\n\n📤 MESSAGES SENT TO API:\n"
             for i, msg in enumerate(api_messages):
                 gui_message += f"Message {i+1} ({msg['role']}):\n{msg['content'][:200]}...\n\n"
-            add_gui_message(gui_message, "SHOULD_RESPOND_API")
+            if GUI_AVAILABLE:
+                add_gui_message(gui_message, "SHOULD_RESPOND_API")
             
             # Get response from OpenAI
             response = self.openai_client.chat.completions.create(
@@ -1324,20 +1590,23 @@ Answer:"""
             
             # Extract and log the response
             response_text = response.choices[0].message.content.strip()
-            should_respond = response_text.lower().endswith('yes')
+            should_respond = _affirmative_yes_no(response_text)
             
-            # Log the API response
-            logger.info("=" * 80)
-            logger.info("[Space Lord] 📥 SHOULD_RESPOND API RESPONSE:")
-            logger.info("=" * 80)
-            logger.info(f"Raw Response: {response_text}")
-            logger.info(f"Should Respond: {should_respond}")
-            logger.info(f"Usage: {response.usage}")
-            logger.info("=" * 80)
+            if self._verbose_space_lord_api_log():
+                logger.info("=" * 80)
+                logger.info("[Space Lord] 📥 SHOULD_RESPOND API RESPONSE:")
+                logger.info("=" * 80)
+                logger.info(f"Raw Response: {response_text}")
+                logger.info(f"Should Respond: {should_respond}")
+                logger.info(f"Usage: {response.usage}")
+                logger.info("=" * 80)
+            else:
+                logger.info("[Space Lord] should_respond -> %s (%r)", should_respond, response_text[:200])
             
             # Send to GUI
             gui_message = f"📥 SHOULD_RESPOND API RESPONSE:\nRaw Response: {response_text}\nShould Respond: {should_respond}\nUsage: {response.usage}"
-            add_gui_message(gui_message, "SHOULD_RESPOND_API")
+            if GUI_AVAILABLE:
+                add_gui_message(gui_message, "SHOULD_RESPOND_API")
             
             # Update last response time if we're going to respond
             if should_respond:
@@ -1349,14 +1618,14 @@ Answer:"""
             _log_space_lord_openai_error("should_respond", e)
             return False
     
-    async def respond_to_chat(self, username: str, message: str) -> str:
+    async def respond_to_chat(self, username: str, message: str, *, append_context: bool = True) -> str:
         """Generate a Space Lord response to a chat message."""
         try:
-            # Add the message to memories
-            self.add_memory(f"{username}: {message}")
+            if append_context:
+                self._append_recent_chat(username, message)
             
             # Prepare context for OpenAI with Discord persona and memories
-            local_memories = "\n".join(self.memories[-10:])  # Last 10 local memories
+            local_memories = self._recent_chat_context(12)
             discord_memories = self.discord_memories if self.discord_memories_loaded else ""
             
             # Combine local and Discord memories
@@ -1383,20 +1652,28 @@ Respond as Space Lord to this message. Keep your response under 100 words, engag
                 {"role": "user", "content": prompt}
             ]
             
-            # Log the complete API request
-            logger.info("=" * 80)
-            logger.info("[Space Lord] 🚀 GENERATE_RESPONSE API REQUEST:")
-            logger.info("=" * 80)
-            logger.info(f"Model: {self.config['openai']['model']}")
-            logger.info(f"Temperature: {self.config['openai']['temperature']}")
-            logger.info(f"Max Tokens: {self.config['openai']['max_tokens']}")
-            logger.info("")
-            logger.info("📤 MESSAGES SENT TO API:")
-            for i, msg in enumerate(api_messages):
-                logger.info(f"Message {i+1} ({msg['role']}):")
-                logger.info(f"Content: {msg['content']}")
+            # Log compact by default
+            if self._verbose_space_lord_api_log():
+                logger.info("=" * 80)
+                logger.info("[Space Lord] 🚀 GENERATE_RESPONSE API REQUEST:")
+                logger.info("=" * 80)
+                logger.info(f"Model: {self.config['openai']['model']}")
+                logger.info(f"Temperature: {self.config['openai']['temperature']}")
+                logger.info(f"Max Tokens: {self.config['openai']['max_tokens']}")
                 logger.info("")
-            logger.info("=" * 80)
+                logger.info("📤 MESSAGES SENT TO API:")
+                for i, msg in enumerate(api_messages):
+                    logger.info(f"Message {i+1} ({msg['role']}):")
+                    logger.info(f"Content: {msg['content']}")
+                    logger.info("")
+                logger.info("=" * 80)
+            else:
+                logger.info(
+                    "[Space Lord] generate_response model=%s max_tokens=%s prompt_chars=%s",
+                    self.config["openai"]["model"],
+                    self.config["openai"]["max_tokens"],
+                    sum(len(str(m.get("content", ""))) for m in api_messages),
+                )
             
             # Send to GUI
             gui_message = f"🤖 GENERATE_RESPONSE API REQUEST:\nModel: {self.config['openai']['model']}\nTemperature: {self.config['openai']['temperature']}\nMax Tokens: {self.config['openai']['max_tokens']}\n\n📤 MESSAGES SENT TO API:\n"
@@ -1414,13 +1691,19 @@ Respond as Space Lord to this message. Keep your response under 100 words, engag
             
             response_text = response.choices[0].message.content.strip()
             
-            # Log the API response
-            logger.info("=" * 80)
-            logger.info("[Space Lord] 📥 GENERATE_RESPONSE API RESPONSE:")
-            logger.info("=" * 80)
-            logger.info(f"Generated Response: {response_text}")
-            logger.info(f"Usage: {response.usage}")
-            logger.info("=" * 80)
+            if self._verbose_space_lord_api_log():
+                logger.info("=" * 80)
+                logger.info("[Space Lord] 📥 GENERATE_RESPONSE API RESPONSE:")
+                logger.info("=" * 80)
+                logger.info(f"Generated Response: {response_text}")
+                logger.info(f"Usage: {response.usage}")
+                logger.info("=" * 80)
+            else:
+                logger.info(
+                    "[Space Lord] generated (%s chars) usage=%s",
+                    len(response_text),
+                    getattr(response, "usage", ""),
+                )
             
             # Send to GUI
             gui_message = f"📥 GENERATE_RESPONSE API RESPONSE:\nGenerated Response: {response_text}\nUsage: {response.usage}"
@@ -1434,14 +1717,18 @@ Respond as Space Lord to this message. Keep your response under 100 words, engag
             try:
                 should_remember = await self.should_remember(username, message, response_text)
                 if should_remember:
-                    logger.info(f"[SpaceLord] 💾 Interaction deemed memorable, adding to Discord memories...")
+                    logger.info("[SpaceLord] Interaction deemed memorable; extracting for Discord...")
                     memory_entry = await self.create_memory_entry(username, message, response_text)
                     if memory_entry:
                         success = await self.add_memory_to_discord(memory_entry)
                         if success:
-                            logger.info(f"[SpaceLord] ✅ Successfully added memory to Discord")
+                            logger.info("[SpaceLord] Successfully added memory to Discord")
                         else:
-                            logger.warning(f"[SpaceLord] ⚠️ Failed to add memory to Discord")
+                            logger.warning("[SpaceLord] Failed to add memory to Discord")
+                    else:
+                        logger.info(
+                            "[SpaceLord] Skipped Discord memory: nothing extractable (NO_KEY_INFO / empty)"
+                        )
             except Exception as e:
                 logger.error(f"[SpaceLord] ❌ Error in memory processing: {e}")
             
@@ -1462,8 +1749,8 @@ Respond as Space Lord to this message. Keep your response under 100 words, engag
         logger.info("[SpaceLord] ✅ Persona updated successfully")
     
     def get_memories(self):
-        """Get Space Lord's recent memories."""
-        return self.memories[-10:]  # Return last 10 memories
+        """Recent chat lines used for context (not the same as Discord permanent memories)."""
+        return list(self.recent_chat)[-10:]
     
     def start_voice_listener(self):
         """Start listening for voice wake words."""
@@ -1515,16 +1802,51 @@ Respond as Space Lord to this message. Keep your response under 100 words, engag
             logger.info(f"[SpaceLord] {message}")
 
 
+def _speech_microphone_from_config(config: dict) -> sr.Microphone:
+    """Windows default recording device, or ``audio.input_device`` substring match (PyAudio)."""
+    audio_sec = (config.get("audio") or {})
+    raw = (audio_sec.get("input_device") or "").strip().lower()
+    pa = pyaudio.PyAudio()
+    try:
+        if not raw or raw in ("default", "pc", "auto"):
+            di = int(pa.get_default_input_device_info()["index"])
+            nm = pa.get_device_info_by_index(di).get("name", "?")
+            logger.info("[VoiceListener] Using Windows default recording device #%s: %s", di, nm)
+            return sr.Microphone(device_index=di)
+        needle = raw
+        for i in range(pa.get_device_count()):
+            inf = pa.get_device_info_by_index(i)
+            if int(inf.get("maxInputChannels") or 0) < 1:
+                continue
+            name = str(inf.get("name", "")).lower()
+            if needle in name:
+                logger.info(
+                    "[VoiceListener] Using input device #%s (matched %r): %s",
+                    i,
+                    needle,
+                    inf.get("name"),
+                )
+                return sr.Microphone(device_index=i)
+        logger.warning("[VoiceListener] No input device contains %r — using Windows default", needle)
+        di = int(pa.get_default_input_device_info()["index"])
+        return sr.Microphone(device_index=di)
+    finally:
+        pa.terminate()
+
+
 class VoiceListener:
     """Listens for voice wake words and processes voice commands."""
     
     def __init__(self, space_lord):
         self.space_lord = space_lord
         self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
+        self.microphone = _speech_microphone_from_config(space_lord.config)
         self.is_listening = False
         self.audio_queue = queue.Queue()
         self.wake_words = ["hey mudflap", "hey space lord", "mudflap", "space lord"]
+        tw = (space_lord.config or {}).get("twitch") or {}
+        # When false, every Google STT result is passed to the command handler (test / no wake phrase).
+        self.require_wake_word = bool(tw.get("local_voice_listener_require_wake_word", True))
         
         # Adjust for ambient noise
         with self.microphone as source:
@@ -1536,29 +1858,53 @@ class VoiceListener:
         self.is_listening = True
         self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listen_thread.start()
-        logger.info("[VoiceListener] 🎤 Started listening for wake words")
+        if self.require_wake_word:
+            logger.info("[VoiceListener] 🎤 Started listening for wake words")
+        else:
+            logger.info(
+                "[VoiceListener] 🎤 Started listening (local_voice_listener_require_wake_word=false — "
+                "every phrase handled, no wake word)"
+            )
         
         # Send test message to GUI
         self.space_lord._send_to_gui("🎤 Voice listener thread started and listening", "VOICE_LISTENER")
         
-        # Simple microphone test - just basic access check
+        # Simple microphone access check — details at DEBUG unless logging.verbose_voice_listener_startup
         try:
-            logger.info("[VoiceListener] 🧪 Testing microphone access...")
-            logger.info(f"[VoiceListener] 🧪 Microphone object: {self.microphone}")
-            logger.info(f"[VoiceListener] 🧪 Microphone type: {type(self.microphone)}")
-            
-            # Just check if we can access the microphone object
-            logger.info("[VoiceListener] 🧪 Microphone object accessible")
-            
-            # Try to get basic info without opening the source
+            lg = (self.space_lord.config.get("logging") or {})
+            dbg = self.space_lord.config.get("debug") or {}
+            mic_verbose = bool(lg.get("verbose_voice_listener_startup")) or bool(dbg.get("enabled"))
+            idx = getattr(self.microphone, "device_index", None)
+            logger.info("[VoiceListener] Microphone ready (device_index=%s)", idx)
+            if mic_verbose:
+                logger.info("[VoiceListener] Testing microphone access (verbose)...")
+                logger.info("[VoiceListener] Microphone object: %s", self.microphone)
+            else:
+                logger.debug("[VoiceListener] Microphone object: %s", self.microphone)
+
             try:
-                logger.info(f"[VoiceListener] 🧪 Microphone device index: {self.microphone.device_index}")
-                logger.info(f"[VoiceListener] 🧪 Microphone list: {sr.Microphone.list_microphone_names()}")
+                if mic_verbose:
+                    logger.info("[VoiceListener] Microphone device index: %s", idx)
+                    logger.info(
+                        "[VoiceListener] Microphone list: %s",
+                        sr.Microphone.list_microphone_names(),
+                    )
+                else:
+                    try:
+                        _names = sr.Microphone.list_microphone_names()
+                        _n = len(_names)
+                    except Exception:
+                        _n = "?"
+                    logger.debug(
+                        "[VoiceListener] %s input device names (logging.verbose_voice_listener_startup for full list)",
+                        _n,
+                    )
             except Exception as info_error:
-                logger.warning(f"[VoiceListener] ⚠️ Could not get microphone info: {info_error}")
+                logger.warning("[VoiceListener] Could not get microphone info: %s", info_error)
             
-            logger.info("[VoiceListener] 🧪 Basic microphone test successful")
-                
+            if mic_verbose:
+                logger.info("[VoiceListener] Basic microphone test successful")
+
         except Exception as e:
             logger.error(f"[VoiceListener] ❌ Microphone test failed: {e}")
             import traceback
@@ -1632,17 +1978,20 @@ class VoiceListener:
             # Send to GUI if available (safely)
             logger.debug(f"[VoiceListener-{thread_id}] 🎤 Attempting to send to GUI...")
             try:
-                self.space_lord._send_to_gui(f"🎤 Heard: {text}", "VOICE_LISTENER")
+                self.space_lord._send_to_gui(f"LOCAL - {text}", "TRANSCRIPT")
                 logger.debug(f"[VoiceListener-{thread_id}] 🎤 GUI update successful")
             except Exception as gui_error:
                 logger.error(f"[VoiceListener-{thread_id}] ❌ GUI error: {gui_error}")
             
-            # Check for wake words
+            # Wake word gate (optional — off for transcription / command test)
             logger.debug(f"[VoiceListener-{thread_id}] 🎤 Checking for wake words...")
-            if any(wake_word in text for wake_word in self.wake_words):
+            if not self.require_wake_word:
+                logger.info(f"[VoiceListener-{thread_id}] 🎧 Passthrough (no wake word): {text}")
+                self._process_command(text)
+            elif any(wake_word in text for wake_word in self.wake_words):
                 logger.info(f"[VoiceListener-{thread_id}] 🚨 WAKE WORD DETECTED: {text}")
                 try:
-                    self.space_lord._send_to_gui(f"🚨 WAKE WORD DETECTED: {text}", "VOICE_LISTENER")
+                    self.space_lord._send_to_gui(f"Mic - Wake Word - {text}", "TRANSCRIPT")
                 except Exception as gui_error:
                     logger.error(f"[VoiceListener-{thread_id}] ❌ GUI error: {gui_error}")
                 
@@ -1719,6 +2068,7 @@ class VoiceListener:
                 command = self.recognizer.recognize_google(audio).lower()
                 
                 logger.info(f"[VoiceListener] 🎤 Command received: {command}")
+                self.space_lord._send_to_gui(f"LOCAL - {command}", "TRANSCRIPT")
                 self._process_command(command)
                 
         except sr.WaitTimeoutError:
@@ -1768,7 +2118,9 @@ class TwitchBot(twitch_commands.Bot):
         logger.info(f"[Twitch] 🔍 Original token: {original_token[:20]}...")
         logger.info(f"[Twitch] 🔍 Processed token: {token[:20]}...")
         logger.info(f"[Twitch] 🔍 Using client_id: {config['twitch']['client_id']}")
-        logger.info(f"[Twitch] 🔍 Bot account (login): {config['twitch']['bot_username']}")
+        _tw_login = config["twitch"]["bot_username"]
+        _tw_show = str(config["twitch"].get("display_name") or "").strip()
+        logger.info("[Twitch] 🔍 Bot account (login): %s%s", _tw_login, (f"; display_name={_tw_show!r}" if _tw_show else ""))
         logger.info(f"[Twitch] 🔍 Chat channel login: {config['twitch']['channel']}")
 
         self._oauth_access_token = token
@@ -1805,6 +2157,20 @@ class TwitchBot(twitch_commands.Bot):
         self._discord_listen_proc: multiprocessing.Process | None = None
         self._discord_tx_proc: multiprocessing.Process | None = None
         self._discord_pcm_queue: Any = None
+        self._discord_local_mic_stop: threading.Event | None = None
+        self._discord_local_mic_thread: threading.Thread | None = None
+        self._discord_laptop_mic_stop: threading.Event | None = None
+        self._discord_laptop_mic_thread: threading.Thread | None = None
+        self._discord_speaker_event_queue: Any = None
+        self._discord_speaker_local_stop: threading.Event | None = None
+        self._discord_speaker_local_thread: threading.Thread | None = None
+        self._transcribe_gui_queue: Any = None
+        self._transcribe_gui_mirror_task: asyncio.Task | None = None
+        self._voicemeeter_capture_task: asyncio.Task | None = None
+        self._discord_speak_queue: Any = None
+        self._conversation_queue: queue.Queue[tuple[str, str, str] | None] = queue.Queue()
+        self._conversation_worker: threading.Thread | None = None
+        self._conversation_worker_event_loop: asyncio.AbstractEventLoop | None = None
         logger.info("[Twitch][debug] twitchio version=%s", getattr(twitchio, "__version__", "?"))
 
     def _twitch_verbose_debug(self) -> bool:
@@ -1812,6 +2178,148 @@ class TwitchBot(twitch_commands.Bot):
         tw = self.config.get('twitch', {})
         dbg = self.config.get('debug', {})
         return bool(tw.get('verbose_debug')) or bool(dbg.get('enabled'))
+
+    def _twitch_user_facing_bot_name(self) -> str:
+        """Human-facing name for logs/GUI — ``twitch.display_name`` else ``bot_username``."""
+        tw = self.config.get("twitch") or {}
+        alias = str(tw.get("display_name") or "").strip()
+        return alias if alias else str(tw.get("bot_username") or "").strip().lstrip("#") or "bot"
+
+    def _tts_to_discord_enabled(self) -> bool:
+        dcfg = self.config.get("discord_voice_transcribe") or {}
+        join_vc = bool(dcfg.get("discord_join_voice_channel", True))
+        return join_vc and bool(dcfg.get("tts_to_discord", True))
+
+    async def _speak_to_discord(self, text: str, *, voice: str = "female") -> bool:
+        """Queue TTS for playback in Discord voice channel (listen worker process)."""
+        text = (text or "").strip()
+        if not text:
+            return False
+        if self._tts_to_discord_enabled() and self._discord_speak_queue is not None:
+            try:
+                await asyncio.to_thread(self._discord_speak_queue.put, (text, voice), True, 10.0)
+                logger.info("[Twitch] Queued Discord VC TTS: %r", text[:120])
+                return True
+            except Exception as e:
+                logger.error("[Twitch] Discord VC TTS queue failed: %s — falling back to desktop", e)
+        return await self.tts_system.speak(text)
+
+    def _transcript_is_local_mic(self, kind: str, display_name: str) -> bool:
+        """LOCAL feed lines are only for the physical mic (uid -2), not Discord VC/phone."""
+        kind_key = str(kind or "").strip().lower()
+        if kind_key == "local":
+            return True
+        # Mis-tagged local mic on the Voicemeeter/phone path (label LOCAL, uid -1).
+        if kind_key == "discord_phone" and str(display_name or "").strip().upper() == "LOCAL":
+            return True
+        return False
+
+    def _read_discord_vc_aloud_enabled(self) -> bool:
+        dcfg = self.config.get("discord_voice_transcribe") or {}
+        if "read_discord_vc_aloud" in dcfg:
+            return bool(dcfg.get("read_discord_vc_aloud"))
+        return bool(self.config.get("twitch", {}).get("always_read_chat", True))
+
+    def _discord_vc_skip_names(self) -> set[str]:
+        _, skip_names = parse_discord_vc_skip_sets(self.config.get("discord_voice_transcribe") or {})
+        return skip_names
+
+    def _is_self_discord_speaker(self, display_name: str) -> bool:
+        """True when the transcript is from the host (discord_vc_skip_display_names)."""
+        name = str(display_name or "").strip().lower()
+        return bool(name) and name in self._discord_vc_skip_names()
+
+    def _should_read_discord_transcript_aloud(self, kind: str, display_name: str) -> bool:
+        if not self._read_discord_vc_aloud_enabled():
+            return False
+        if self._transcript_is_local_mic(kind, display_name):
+            return False
+        kind_key = str(kind or "").strip().lower()
+        if kind_key not in ("discord_vc", "discord", "discord_phone"):
+            return False
+        return not self._is_self_discord_speaker(display_name)
+
+    async def _read_discord_transcript_aloud(self, username: str, message: str) -> None:
+        """Speak another Discord VC user's transcript (same style as Twitch chat readout)."""
+        message = (message or "").strip()
+        if not message:
+            return
+        user = (username or "").strip() or "Discord"
+        if len(user) > 15:
+            user = user[:15]
+        tts_text = f"{user} says: {message}"
+        logger.info("[Twitch] Discord VC TTS: %s", tts_text[:120])
+        await self._speak_to_discord(tts_text, voice="female")
+
+    def _format_live_feed_line(self, source: str, username: str, text: str) -> str:
+        snippet = (text or "")[:800]
+        if len(text or "") > 800:
+            snippet += "…"
+        src = source.strip().upper()
+        user = (username or "").strip()
+        if src == "LOCAL":
+            return f"LOCAL - {snippet}"
+        if src in ("DISCORD", "DISCORD VC", "DISCORD PHONE"):
+            return f"DISCORD - {user} - {snippet}" if user else f"DISCORD - {snippet}"
+        if src == "TWITCH":
+            return f"TWITCH - {user} - {snippet}"
+        return f"{src} - {user} - {snippet}" if user else f"{src} - {snippet}"
+
+    def _enqueue_conversation(self, source: str, username: str, message: str) -> None:
+        """Feed LOCAL/DISCORD/TWITCH lines into the Space Lord decision worker thread."""
+        message = (message or "").strip()
+        if not message:
+            return
+        if not self.config.get("twitch", {}).get("space_lord_enabled", True):
+            return
+        chat_user = username if source.upper() == "TWITCH" else f"[{source.upper()}] {username or 'unknown'}"
+        self.space_lord._append_recent_chat(chat_user, message)
+        self._conversation_queue.put((source.upper(), username or "unknown", message))
+        logger.info("[SpaceLord] Queued [%s] %s: %s", source.upper(), username, message[:120])
+
+    def _conversation_worker_loop(self) -> None:
+        """Background thread: should_respond then generate/speak Space Lord reply."""
+        loop = asyncio.new_event_loop()
+        self._conversation_worker_event_loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            while True:
+                item = self._conversation_queue.get()
+                if item is None:
+                    break
+                source, username, message = item
+                try:
+                    loop.run_until_complete(self._run_space_lord_pipeline(source, username, message))
+                except Exception as e:
+                    logger.error("[SpaceLord] Conversation worker error: %s", e, exc_info=True)
+        finally:
+            loop.close()
+            self._conversation_worker_event_loop = None
+
+    async def _run_space_lord_pipeline(self, source: str, username: str, message: str) -> None:
+        chat_user = username if source == "TWITCH" else f"[{source}] {username}"
+        should_respond = await self.space_lord.should_respond(chat_user, message, append_context=False)
+        if not should_respond:
+            logger.debug("[SpaceLord] Not responding to [%s] %s: %s", source, username, message[:80])
+            return
+        response = await self.space_lord.respond_to_chat(chat_user, message, append_context=False)
+        if not response:
+            return
+        logger.info("[SpaceLord] Responding to [%s] %s: %s", source, username, response)
+        if GUI_AVAILABLE:
+            add_gui_message(self._format_live_feed_line("SPACE LORD", "Space Lord", response), "SPACE_LORD")
+        await self._speak_to_discord(f"Space Lord says: {response}", voice="male")
+
+    def _start_conversation_worker(self) -> None:
+        if self._conversation_worker is not None and self._conversation_worker.is_alive():
+            return
+        self._conversation_worker = threading.Thread(
+            target=self._conversation_worker_loop,
+            name="space-lord-conversation",
+            daemon=True,
+        )
+        self._conversation_worker.start()
+        logger.info("[Twitch] Space Lord conversation worker thread started")
 
     def _tw_http_exc_extras(self, e: BaseException) -> str:
         """Collect HTTPException-ish fields without tokens."""
@@ -2010,48 +2518,209 @@ class TwitchBot(twitch_commands.Bot):
             raise
 
         self._eventsub_chat_ready = True
-    
+
+    async def _start_voicemeeter_captures_deferred(
+        self, dcfg: dict[str, Any], q: Any, *, join_vc: bool
+    ) -> None:
+        """Start Voicemeeter capture after Discord voice connect (avoids opening Out devices first)."""
+        from discord_voice_local_mic import run_local_mic_to_queue
+
+        delay = float(dcfg.get("local_microphone_start_delay_seconds", 0) or 0)
+        if delay <= 0 and join_vc:
+            delay = float(dcfg.get("voice_connect_delay_seconds", 5) or 5) + float(
+                dcfg.get("local_microphone_after_voice_extra_seconds", 3) or 3
+            )
+        if delay > 0:
+            logger.info(
+                "[Twitch] Waiting %.1fs before Voicemeeter capture (let Discord join voice first)",
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+        try:
+            from audio_device_detect import resolve_capture_plan
+
+            plan = resolve_capture_plan(dcfg)
+            for warn in plan.warnings:
+                logger.warning("[Twitch] %s", warn)
+
+            from discord_voice_common import (
+                config_bool,
+                receive_vc_audio_enabled,
+                speaker_gated_local_transcribe_enabled,
+            )
+
+            speaker_gated = speaker_gated_local_transcribe_enabled(dcfg)
+            speaker_q = getattr(self, "_discord_speaker_event_queue", None)
+            if speaker_gated and speaker_q is not None:
+                from discord_speaker_local_capture import run_speaker_gated_local_capture
+
+                ev = threading.Event()
+                th = threading.Thread(
+                    target=run_speaker_gated_local_capture,
+                    args=(self.config_path, q, speaker_q, ev),
+                    name="discord-speaker-local",
+                    daemon=True,
+                )
+                self._discord_speaker_local_stop = ev
+                self._discord_speaker_local_thread = th
+                th.start()
+                bus = str(dcfg.get("voicemeeter_bus") or "").strip().upper() or "B1"
+                logger.info(
+                    "[Twitch] Speaker-local transcribe: Voicemeeter %s per Discord VC user "
+                    "(set Discord OUTPUT → Voicemeeter VAIO).",
+                    bus,
+                )
+            use_vm_playback = (
+                not speaker_gated
+                and config_bool(
+                    dcfg.get("voicemeeter_playback_transcribe"),
+                    not receive_vc_audio_enabled(dcfg),
+                )
+            )
+            if use_vm_playback:
+                ev = threading.Event()
+                th = threading.Thread(
+                    target=run_local_mic_to_queue,
+                    args=(self.config_path, q, ev),
+                    kwargs={
+                        "device_substring": plan.playback_device,
+                        "label_override": plan.playback_label,
+                        "capture_uid": -1,
+                    },
+                    name="discord-local-mic",
+                    daemon=True,
+                )
+                self._discord_local_mic_stop = ev
+                self._discord_local_mic_thread = th
+                th.start()
+                bus = str(dcfg.get("voicemeeter_bus") or "").strip().upper() or "?"
+                logger.info(
+                    "[Twitch] Voicemeeter playback → transcribe (capture=%r, label=%r). "
+                    "Route Discord OUTPUT (VAIO) to bus %s only — not to mic bus.",
+                    plan.playback_device,
+                    plan.playback_label,
+                    bus,
+                )
+            else:
+                logger.info(
+                    "[Twitch] Voicemeeter B1 playback capture OFF (speaker_local uses B1 + optional VC fallback)."
+                )
+
+            local_dev = (plan.local_mic_device or plan.mic_device or "").strip()
+
+            if local_dev and config_bool(dcfg.get("local_microphone_transcribe"), True):
+                lev = threading.Event()
+                lth = threading.Thread(
+                    target=run_local_mic_to_queue,
+                    args=(self.config_path, q, lev),
+                    kwargs={
+                        "device_substring": local_dev,
+                        "label_override": "LOCAL",
+                        "capture_uid": -2,
+                    },
+                    name="discord-laptop-mic",
+                    daemon=True,
+                )
+                self._discord_laptop_mic_stop = lev
+                self._discord_laptop_mic_thread = lth
+                lth.start()
+                if plan.local_mic_is_voicemeeter_out:
+                    logger.info(
+                        "[Twitch] LOCAL mic → transcribe (Voicemeeter %r). "
+                        "Route HW input → bus %s; VAIO must not feed this bus.",
+                        local_dev,
+                        dcfg.get("voicemeeter_mic_bus") or "B2",
+                    )
+                else:
+                    logger.info(
+                        "[Twitch] LOCAL mic → transcribe (physical/WASAPI %r, mode=%s).",
+                        local_dev,
+                        getattr(plan, "local_mic_capture_mode", "auto"),
+                    )
+        except Exception as le:
+            logger.error("[Twitch] Could not start Voicemeeter capture: %s", le, exc_info=True)
+
+    async def _drain_transcribe_gui_mirror(self) -> None:
+        """Relay Discord/Whisper lines from transcribe subprocess to the GUI live feed."""
+        q = self._transcribe_gui_queue
+        if q is None:
+            return
+        try:
+            while True:
+                try:
+                    item = await asyncio.to_thread(q.get, True, 0.5)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    break
+                try:
+                    kind, display_name, text = item
+                except (TypeError, ValueError):
+                    continue
+                kind_key = str(kind).strip().lower()
+                if kind_key == "discord_heard":
+                    # VC activity hint only — do not clutter the GUI live feed.
+                    logger.debug(
+                        "[Twitch] VC activity %s: %s",
+                        display_name,
+                        (text or "")[:120],
+                    )
+                    continue
+                speak_aloud = False
+                tts_user = ""
+                if self._transcript_is_local_mic(kind_key, display_name):
+                    line = self._format_live_feed_line("LOCAL", "", text)
+                    self._enqueue_conversation("LOCAL", "You", text)
+                elif kind_key in ("discord_vc", "discord", "discord_phone"):
+                    tts_user = (display_name or "").strip() or "Call"
+                    line = self._format_live_feed_line("DISCORD", tts_user, text)
+                    self._enqueue_conversation("DISCORD", tts_user, text)
+                    speak_aloud = self._should_read_discord_transcript_aloud(kind_key, tts_user)
+                else:
+                    tts_user = (display_name or "").strip() or "unknown"
+                    line = self._format_live_feed_line("DISCORD", tts_user, text)
+                    self._enqueue_conversation("DISCORD", tts_user, text)
+                    speak_aloud = self._should_read_discord_transcript_aloud(kind_key, tts_user)
+                logger.info("[Twitch] %s", line[:400])
+                try:
+                    from gui_monitor import add_gui_message
+
+                    add_gui_message(line, "TRANSCRIPT")
+                except Exception:
+                    pass
+                if speak_aloud:
+                    try:
+                        await self._read_discord_transcript_aloud(tts_user, text)
+                    except Exception as tts_err:
+                        logger.error("[Twitch] Discord transcript TTS failed: %s", tts_err)
+        except asyncio.CancelledError:
+            raise
+
     async def event_ready(self):
         """Called when Twitch bot is ready."""
-        bot_username = self.config['twitch']['bot_username']
+        bot_username = self.config["twitch"]["bot_username"]
+        bot_label = self._twitch_user_facing_bot_name()
         if not getattr(self, "_eventsub_chat_ready", False):
             logger.warning(
                 "[Twitch] EventSub chat subscription did not complete; you will not receive chat until "
                 "bot_token (and refresh_token) are valid — see errors above. Retries may show this if login was skipped."
             )
-        logger.info(f"[Twitch] ✅ Bot is ready: {bot_username}")
+        logger.info(
+            "[Twitch] ✅ Bot is ready: %s%s",
+            bot_label,
+            (f" (login {bot_username})" if bot_label.lower() != str(bot_username).lower() else ""),
+        )
         logger.info(f"[Twitch] ✅ Connected to channel: {self.config['twitch']['channel']}")
         logger.info("[Twitch] 🔄 Bot is running and reading chat messages...")
         logger.info(f"[Twitch] 🔍 Bot will read messages from: {self.config['twitch']['channel']}")
         logger.info(f"[Twitch] 🎤 TTS system ready: {self.tts_system is not None}")
         
-        # Test: Try to send a message to verify we can write to the channel
-        try:
-            channel_name = self.config['twitch']['channel']
-            logger.info(f"[Twitch] 🧪 Testing channel write access...")
-            # This will help verify the bot has proper permissions
-            logger.info(f"[Twitch] 🧪 Bot should be able to read from: {channel_name}")
-            
-            # Try to send a test message to verify the bot is working
-            logger.info(f"[Twitch] 🧪 Attempting to send test message...")
-            
-            # Test if we can access the channel object
-            try:
-                if hasattr(self, 'get_channel'):
-                    channel = self.get_channel(channel_name)
-                    if channel:
-                        logger.info(f"[Twitch] ✅ Successfully got channel object: {channel}")
-                        logger.info(f"[Twitch] 🔍 Channel name: {getattr(channel, 'name', 'Unknown')}")
-                        logger.info(f"[Twitch] 🔍 Channel attributes: {[attr for attr in dir(channel) if not attr.startswith('_')]}")
-                    else:
-                        logger.warning(f"[Twitch] ⚠️ Could not get channel object for: {channel_name}")
-                else:
-                    logger.warning(f"[Twitch] ⚠️ No get_channel method available")
-            except Exception as e:
-                logger.error(f"[Twitch] Error getting channel object: {e}")
-            
-        except Exception as e:
-            logger.error(f"[Twitch] Error in channel test: {e}")
+        # TwitchIO 3 + EventSub delivers chat via websocket subscriptions (see setup_hook), not IRC
+        # channel objects. Legacy bots exposed get_channel(login) for IRC; this client has no such API.
+        logger.info(
+            "[Twitch] Chat uses EventSub (channel.chat.message), not IRC-style get_channel(login)."
+        )
         
         # Initialize Discord persona for Space Lord
         try:
@@ -2066,34 +2735,133 @@ class TwitchBot(twitch_commands.Bot):
         try:
             dcfg = self.config.get("discord_voice_transcribe") or {}
             if dcfg.get("enabled"):
+                settle = float(dcfg.get("voice_worker_start_delay_seconds", 2.5))
+                if settle > 0:
+                    logger.info(
+                        "[Twitch] Waiting %.1fs before starting Discord voice workers (session settle; reduces 4006 flakes)",
+                        settle,
+                    )
+                    await asyncio.sleep(settle)
                 from discord_voice_listen_process import listen_process_entry
                 from discord_transcribe_process import transcribe_process_entry
 
                 ctx = multiprocessing.get_context("spawn")
                 q = ctx.Queue(maxsize=32)
                 self._discord_pcm_queue = q
+                mirror = bool(dcfg.get("mirror_transcripts_to_gui", True))
+                gui_q = ctx.Queue(maxsize=128) if mirror else None
+                self._transcribe_gui_queue = gui_q
+                speak_q = ctx.Queue(maxsize=16) if self._tts_to_discord_enabled() else None
+                self._discord_speak_queue = speak_q
+                tx_args: tuple[Any, ...] = (self.config_path, q)
+                if mirror:
+                    tx_args = (self.config_path, q, gui_q)
                 self._discord_tx_proc = ctx.Process(
                     target=transcribe_process_entry,
-                    args=(self.config_path, q),
+                    args=tx_args,
                     name="discord-transcribe",
                 )
-                self._discord_listen_proc = ctx.Process(
-                    target=listen_process_entry,
-                    args=(self.config_path, q),
-                    name="discord-listen",
-                )
                 self._discord_tx_proc.start()
-                self._discord_listen_proc.start()
-                logger.info(
-                    "[Twitch] 🎙️ Discord voice: transcribe worker PID=%s, listen worker PID=%s (main process = Twitch/TTS)",
-                    self._discord_tx_proc.pid,
-                    self._discord_listen_proc.pid,
+                from discord_voice_common import (
+                    join_discord_voice_channel_enabled,
+                    receive_vc_audio_enabled,
+                    speaker_gated_local_transcribe_enabled,
                 )
+
+                audio_src = str(dcfg.get("discord_audio_source") or "discord_vc").strip().lower()
+                speaker_gated = speaker_gated_local_transcribe_enabled(dcfg)
+                speaker_q = ctx.Queue(maxsize=64) if speaker_gated else None
+                self._discord_speaker_event_queue = speaker_q
+                use_vc_listen = receive_vc_audio_enabled(dcfg)
+                use_voicemeeter = audio_src in ("voicemeeter", "both") or speaker_gated
+                join_vc = join_discord_voice_channel_enabled(dcfg)
+                if not use_vc_listen and not use_voicemeeter:
+                    logger.error(
+                        "[Twitch] discord_voice_transcribe enabled but no audio source "
+                        "(set discord_audio_source to discord_vc, voicemeeter, or both)"
+                    )
+                if join_vc or use_vc_listen:
+                    listen_args: tuple[Any, ...] = (self.config_path, q)
+                    if speak_q is not None:
+                        listen_args = (self.config_path, q, speak_q)
+                    if speaker_q is not None:
+                        listen_args = (*listen_args, speaker_q)
+                    self._discord_listen_proc = ctx.Process(
+                        target=listen_process_entry,
+                        args=listen_args,
+                        name="discord-listen",
+                    )
+                    self._discord_listen_proc.start()
+                else:
+                    self._discord_listen_proc = None
+                if self._transcribe_gui_queue is not None:
+                    self._transcribe_gui_mirror_task = asyncio.create_task(
+                        self._drain_transcribe_gui_mirror(),
+                        name="discord-transcribe-gui-mirror",
+                    )
+                if speaker_gated and self._discord_listen_proc is not None:
+                    logger.info(
+                        "[Twitch] Discord voice: transcribe PID=%s, VC speaker-detect PID=%s, "
+                        "local playback per user (Voicemeeter %s)",
+                        self._discord_tx_proc.pid,
+                        self._discord_listen_proc.pid,
+                        dcfg.get("voicemeeter_bus") or "B1",
+                    )
+                elif use_vc_listen and self._discord_listen_proc is not None:
+                    logger.info(
+                        "[Twitch] Discord voice: transcribe PID=%s, VC listen PID=%s",
+                        self._discord_tx_proc.pid,
+                        self._discord_listen_proc.pid,
+                    )
+                elif use_voicemeeter and join_vc and self._discord_listen_proc is not None:
+                    logger.info(
+                        "[Twitch] Discord voice: transcribe PID=%s, VC join PID=%s "
+                        "(in channel, receive OFF — Voicemeeter B1 only)",
+                        self._discord_tx_proc.pid,
+                        self._discord_listen_proc.pid,
+                    )
+                elif use_voicemeeter:
+                    logger.info(
+                        "[Twitch] Discord voice: transcribe PID=%s — Voicemeeter only (no VC join)",
+                        self._discord_tx_proc.pid,
+                    )
+                else:
+                    logger.info(
+                        "[Twitch] Discord voice: transcribe PID=%s (audio_source=%s)",
+                        self._discord_tx_proc.pid,
+                        audio_src,
+                    )
+                if use_voicemeeter:
+                    self._voicemeeter_capture_task = asyncio.create_task(
+                        self._start_voicemeeter_captures_deferred(dcfg, q, join_vc=join_vc),
+                        name="voicemeeter-capture-deferred",
+                    )
         except Exception as e:
             logger.error("[Twitch] ❌ Could not start Discord voice workers: %s", e)
+
+        self._start_conversation_worker()
         
-        # Voice listener disabled - focusing on Twitch chat only
-        logger.info("[Twitch] 🎤 Voice listener disabled - focusing on Twitch chat reading")
+        # Local PC microphone (wake words via speech_recognition) — optional; see twitch.local_voice_listener
+        tw_listen = self.config.get("twitch") or {}
+        if tw_listen.get("local_voice_listener"):
+            try:
+                await asyncio.to_thread(self.space_lord.start_voice_listener)
+                req = bool(tw_listen.get("local_voice_listener_require_wake_word", True))
+                if req:
+                    logger.info(
+                        "[Twitch] Local mic voice listener started (wake phrases: hey space lord, mudflap, …; Google STT)"
+                    )
+                else:
+                    logger.info(
+                        "[Twitch] Local mic voice listener started (wake word OFF — every phrase → command handler; Google STT)"
+                    )
+            except Exception as e:
+                logger.error("[Twitch] Could not start local voice listener: %s", e, exc_info=True)
+        else:
+            logger.info(
+                "[Twitch] Wake-word listener off — Discord/LOCAL/Twitch transcripts use "
+                "Space Lord should_respond (no wake phrase required)"
+            )
         
         # Verify we're actually in the channel
         try:
@@ -2111,10 +2879,40 @@ class TwitchBot(twitch_commands.Bot):
         
         # Send to GUI if available
         if GUI_AVAILABLE:
-            add_gui_message(f"✅ Twitch bot connected as {bot_username}", "INFO")
+            gui_bot = bot_label + (f" [{bot_username}]" if bot_label.lower() != str(bot_username).lower() else "")
+            add_gui_message(f"✅ Twitch bot connected as {gui_bot}", "INFO")
             add_gui_message(f"📺 Reading chat from: {self.config['twitch']['channel']}", "INFO")
             add_gui_message("🎤 TTS system ready and waiting for messages", "INFO")
             add_gui_message("⏳ Waiting for Twitch messages...", "INFO")
+            dcfg_tx = self.config.get("discord_voice_transcribe") or {}
+            if dcfg_tx.get("enabled"):
+                src = str(dcfg_tx.get("discord_audio_source") or "discord_vc").strip().lower()
+                dest = (
+                    "Discord channel"
+                    if dcfg_tx.get("post_transcripts_to_discord")
+                    else "terminal + Voice Listener panel only"
+                )
+                if src == "voicemeeter":
+                    add_gui_message(
+                        f"📝 Whisper: {dest} — audio from Voicemeeter capture "
+                        f"(label={dcfg_tx.get('local_microphone_label') or 'Discord'}).",
+                        "INFO",
+                    )
+                elif src == "both":
+                    add_gui_message(
+                        f"📝 Whisper: {dest} — Voicemeeter/PC mic + Discord VC per-speaker.",
+                        "INFO",
+                    )
+                elif dcfg_tx.get("post_transcripts_to_discord"):
+                    add_gui_message(
+                        f"📝 Whisper (VC): posted to output channel and {dest}.",
+                        "INFO",
+                    )
+                else:
+                    add_gui_message(
+                        f"📝 Whisper (VC): {dest} (post_transcripts_to_discord=false).",
+                        "INFO",
+                    )
     
     async def event_join(self, channel, user):
         """Called when someone joins the channel."""
@@ -2194,8 +2992,7 @@ class TwitchBot(twitch_commands.Bot):
 
             logger.info("[Twitch] Processing message from %s", chatter.name)
             await self.read_chat_message(chatter.name, text)
-            if self.config.get('twitch', {}).get('space_lord_enabled', True):
-                await self.handle_space_lord_response(chatter.name, text)
+            self._enqueue_conversation("TWITCH", chatter.name, text)
 
             await self.process_commands(message)
 
@@ -2220,16 +3017,14 @@ class TwitchBot(twitch_commands.Bot):
             tts_text = f"{username} says: {message}"
             logger.info(f"[Twitch] 🎤 TTS text: {tts_text}")
             
-            # Speak it aloud through Bluetooth
-            logger.info(f"[Twitch] 🎤 Calling TTS system to speak...")
-            success = await self.tts_system.speak(tts_text)
+            logger.info(f"[Twitch] 🎤 Calling TTS (Discord VC when enabled)...")
+            success = await self._speak_to_discord(tts_text, voice="female")
             logger.info(f"[Twitch] 🎤 TTS result: {success}")
             
             if success:
                 logger.info(f"[Twitch] 🔊 Queued message from {username}: {message}")
-                # Send to GUI if available
                 if GUI_AVAILABLE:
-                    add_gui_message(f"Twitch: {username} says: {message}", "INFO")
+                    add_gui_message(self._format_live_feed_line("TWITCH", username, message), "TRANSCRIPT")
             else:
                 logger.error(f"[Twitch] ❌ Failed to queue message from {username}")
                 # Send error to GUI if available
@@ -2377,10 +3172,24 @@ class HomeyBotHost:
     def __init__(self, config_path="config.yaml", audio_device=None):
         self._config_path = os.path.abspath(str(config_path))
         self.config = self.load_config(self._config_path)
+        _apply_runtime_logging_prefs(self.config)
         
         # Get audio device from config if not specified (auto / empty → Windows default output)
         if audio_device is None:
-            audio_device = self.config.get('audio', {}).get('device', 'default')
+            audio_device = self.config.get("audio", {}).get("device", "default")
+            audio_sec = self.config.get("audio") or {}
+            env_dev = (os.environ.get("HOMEY_AUDIO_DEVICE") or "").strip()
+            if env_dev:
+                logger.info("[HomeyBotHost] HOMEY_AUDIO_DEVICE overrides config audio.device -> %r", env_dev)
+                audio_device = env_dev
+            elif audio_sec.get("use_windows_default_output") or os.environ.get(
+                "HOMEY_USE_DEFAULT_AUDIO", ""
+            ).strip().lower() in ("1", "true", "yes"):
+                logger.info(
+                    "[HomeyBotHost] Windows default output (audio.use_windows_default_output or "
+                    "HOMEY_USE_DEFAULT_AUDIO); ignoring saved audio.device for this host"
+                )
+                audio_device = "default"
         raw_dev = (audio_device or "").strip().lower()
         if raw_dev in ("auto", ""):
             audio_device = "default"
@@ -2389,13 +3198,22 @@ class HomeyBotHost:
         logger.info(f"[HomeyBotHost] 🎵 Config audio device: {self.config.get('audio', {}).get('device', 'NOT_FOUND')}")
         
         # Log available audio devices for debugging
-        self._log_available_audio_devices()
+        if self._list_audio_devices_verbose():
+            self._log_available_audio_devices()
         
-        self.audio_player = DesktopAudioPlayer(audio_device)
+        self.audio_player = DesktopAudioPlayer(
+            audio_device,
+            verbose_device_list=self._list_audio_devices_verbose(),
+        )
         self.tts_system = DesktopTTS(self.audio_player)
         self.twitch_bot = TwitchBot(self.config, self.tts_system, config_path=self._config_path)
         self.twitch_task = None
-    
+
+    def _list_audio_devices_verbose(self) -> bool:
+        lg = self.config.get("logging") or {}
+        dbg = self.config.get("debug") or {}
+        return bool(lg.get("list_audio_devices_verbose")) or bool(dbg.get("enabled"))
+
     def _log_available_audio_devices(self):
         """Log all available audio devices for debugging."""
         try:
@@ -2425,6 +3243,7 @@ class HomeyBotHost:
                 config = yaml.safe_load(file)
             if not isinstance(config, dict):
                 raise ValueError("config YAML root must be a mapping (dictionary)")
+            apply_discord_token_env_override(config)
             logger.info("[Config] ✅ Configuration loaded successfully")
             return config
         except Exception as e:
@@ -2551,9 +3370,64 @@ class HomeyBotHost:
             # Force cleanup of any remaining files with multiple attempts
             await self._force_cleanup_remaining_files()
             
+            gq = getattr(self.twitch_bot, "_transcribe_gui_queue", None)
+            gt = getattr(self.twitch_bot, "_transcribe_gui_mirror_task", None)
+            if gq is not None:
+                try:
+                    gq.put_nowait(None)
+                except Exception:
+                    try:
+                        gq.put(None, timeout=0.5)
+                    except Exception:
+                        pass
+            if gt is not None:
+                try:
+                    await asyncio.wait_for(gt, timeout=3.0)
+                except asyncio.TimeoutError:
+                    gt.cancel()
+                    try:
+                        await gt
+                    except asyncio.CancelledError:
+                        pass
+            if self.twitch_bot is not None:
+                self.twitch_bot._transcribe_gui_mirror_task = None
+                self.twitch_bot._transcribe_gui_queue = None
+
             lp = getattr(self.twitch_bot, "_discord_listen_proc", None)
             tp = getattr(self.twitch_bot, "_discord_tx_proc", None)
             qu = getattr(self.twitch_bot, "_discord_pcm_queue", None)
+            mic_stop = getattr(self.twitch_bot, "_discord_local_mic_stop", None)
+            mic_th = getattr(self.twitch_bot, "_discord_local_mic_thread", None)
+            lap_stop = getattr(self.twitch_bot, "_discord_laptop_mic_stop", None)
+            lap_th = getattr(self.twitch_bot, "_discord_laptop_mic_thread", None)
+            sp_stop = getattr(self.twitch_bot, "_discord_speaker_local_stop", None)
+            sp_th = getattr(self.twitch_bot, "_discord_speaker_local_thread", None)
+            if sp_stop is not None:
+                sp_stop.set()
+            if mic_stop is not None:
+                mic_stop.set()
+            if lap_stop is not None:
+                lap_stop.set()
+            if mic_th is not None and mic_th.is_alive():
+                mic_th.join(timeout=6.0)
+                if mic_th.is_alive():
+                    logger.warning("[HomeyBotHost] Local mic transcribe thread did not exit within 6s")
+            if lap_th is not None and lap_th.is_alive():
+                lap_th.join(timeout=6.0)
+                if lap_th.is_alive():
+                    logger.warning("[HomeyBotHost] Laptop mic transcribe thread did not exit within 6s")
+            if sp_th is not None and sp_th.is_alive():
+                sp_th.join(timeout=6.0)
+                if sp_th.is_alive():
+                    logger.warning("[HomeyBotHost] Speaker-local capture thread did not exit within 6s")
+            if self.twitch_bot is not None:
+                self.twitch_bot._discord_local_mic_stop = None
+                self.twitch_bot._discord_local_mic_thread = None
+                self.twitch_bot._discord_laptop_mic_stop = None
+                self.twitch_bot._discord_laptop_mic_thread = None
+                self.twitch_bot._discord_speaker_local_stop = None
+                self.twitch_bot._discord_speaker_local_thread = None
+                self.twitch_bot._discord_speaker_event_queue = None
             if lp is not None or tp is not None:
                 try:
                     if lp is not None and lp.is_alive():
@@ -2581,6 +3455,11 @@ class HomeyBotHost:
                 self.twitch_bot._discord_tx_proc = None
                 self.twitch_bot._discord_pcm_queue = None
                 logger.info("[HomeyBotHost] Discord voice worker processes stopped")
+
+            try:
+                self.twitch_bot.space_lord.stop_voice_listener()
+            except Exception as e:
+                logger.warning("[HomeyBotHost] stop local voice listener: %s", e)
 
             # Cancel Twitch bot
             if self.twitch_task:
@@ -2622,10 +3501,66 @@ class HomeyBotHost:
         except Exception as e:
             logger.error(f"[HomeyBotHost] Error in force cleanup: {e}")
 
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _ensure_single_instance() -> None:
+    """Stop any existing Homey bot/worker processes, then claim the instance lock."""
+    from bot_process_guard import _run_under_startup_lock, stop_existing_bot_processes
+
+    lock = Path(__file__).resolve().parent / ".homey_bot.pid"
+    pid = os.getpid()
+
+    def _cleanup_and_claim() -> None:
+        stopped = stop_existing_bot_processes(except_pid=pid)
+        if stopped:
+            logger.info("[Main] Stopped %s previous bot process(es); starting fresh", stopped)
+        if lock.exists():
+            try:
+                other = int(lock.read_text(encoding="utf-8").strip())
+            except (ValueError, OSError):
+                other = 0
+            if other and other != pid and _pid_is_running(other):
+                logger.warning(
+                    "[Main] Lock PID %s still running after cleanup — force stopping",
+                    other,
+                )
+                stop_existing_bot_processes(except_pid=pid)
+            try:
+                lock.unlink(missing_ok=True)
+            except TypeError:
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+        try:
+            lock.write_text(str(pid), encoding="utf-8")
+        except OSError as e:
+            logger.warning("[Main] Could not write instance lock file: %s", e)
+
+    _run_under_startup_lock(_cleanup_and_claim)
+
+
 async def main():
     """Main function."""
     import sys
-    
+
     # Parse command line arguments for audio device
     audio_device = None  # Will be read from config file
     
@@ -2639,10 +3574,10 @@ async def main():
                 audio_device = "default"
         else:
             print(f"Usage: python {sys.argv[0]} [default|bluetooth|pc]")
-            print("  default: System default output (OBS-friendly)")
-            print("  bluetooth: Bluetooth output device")
+            print("  default: System default output (OBS-friendly; best for multiple PCs)")
+            print("  bluetooth: First PyAudio device whose name contains bluetooth/bt (explicit opt-in)")
             print("  pc: Same routing as default")
-            print("  (no argument): Use device from config.yaml")
+            print("  (no argument): Use config.yaml audio.device, or HOMEY_AUDIO_DEVICE, or use_windows_default_output")
             print("Using audio device from config file")
     
     logger.info(f"Audio device: {audio_device if audio_device else 'from config.yaml'}")
@@ -2686,7 +3621,14 @@ async def main():
             await bot.stop()
         except Exception as e:
             logger.error(f"[Main] Error during cleanup: {e}")
+        lock = Path(__file__).resolve().parent / ".homey_bot.pid"
+        try:
+            if lock.exists() and lock.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                lock.unlink()
+        except OSError:
+            pass
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    _ensure_single_instance()
     asyncio.run(main())

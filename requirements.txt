@@ -16,6 +16,8 @@ pywin32>=305      # Windows TTS (female voice support)
 
 # Audio processing
 pyaudio>=0.2.11
+sounddevice>=0.5.0   # Windows WASAPI shared capture (mic while Discord holds device)
+numpy>=1.24.0        # required by sounddevice for InputStream buffers
 
 # AI/OpenAI for Space Lord
 openai>=1.0.0
@@ -31,5 +33,6 @@ httpx>=0.24.0
 SpeechRecognition>=3.10.0
 
 # Space Lord persona / memories from Discord (voice extra = PyNaCl + davey for discord.py voice)
-discord.py[voice]>=2.3.0
+discord.py[voice]>=2.6.0  # 2.5.x voice WS 4006 — upgrade required for VC join
+davey>=0.1.5  # Discord VC E2EE — missing this often causes voice WebSocket 4006
 discord-ext-voice-recv==0.5.2a179  # alpha on PyPI — receive Discord VC audio for Whisper transcription

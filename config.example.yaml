@@ -9,18 +9,28 @@ twitch:
   channel: "your_channel_login"
   bot_username: "your_bot_login"
   bot_id: "123456789"
+  # Optional: label shown in logs/GUI; real Twitch login is still bot_username (must match bot_token).
+  # display_name: "My Bot"
   always_read_chat: true
   space_lord_enabled: true
+  # Wake-word PC mic (Google STT). Leave false — voice/chat lines use Space Lord should_respond
+  # (Discord VC transcribe, LOCAL mic transcribe, Twitch chat; no wake phrase required).
+  local_voice_listener: false
+  # local_voice_listener_require_wake_word: true   # only if local_voice_listener: true
 
 discord:
   bot_token: "YOUR_DISCORD_BOT_TOKEN"
+  # Use the Discord app for the bot invited to your server (e.g. homeybot). Optional override:
+  # HOMEY_DISCORD_BOT_TOKEN env var (see discord_voice_common.apply_discord_token_env_override)
+  # Optional: guild id from discord.com/channels/GUILD_ID/CHANNEL_ID — clearer logs if bot not invited
+  # guild_id: "0"
   voice_channel_id: "0"
   persona_channel_id: 0
   memories_channel_id: 0
 
 openai:
   api_key: "YOUR_OPENAI_API_KEY"
-  model: "gpt-4o-mini"   # example; choose what you want
+  model: "gpt-4.1-nano"   # Space Lord should_respond + chat replies (Chat Completions API)
   max_tokens: 150
   temperature: 0.7
   # timeout_seconds: 90
@@ -30,6 +40,13 @@ openai:
 
 audio:
   device: "default"
+  # Recording for twitch.local_voice_listener: default / pc / auto = Windows default mic (explicit index).
+  # Or a substring of the input device name from the PyAudio list in logs.
+  # input_device: default
+  # When true, always use Windows default playback for TTS (ignore device string). Good if one
+  # config.yaml is copied to PCs with different headsets / no Bluetooth.
+  # use_windows_default_output: false
+  # Or set env HOMEY_AUDIO_DEVICE=default (or any device substring) / HOMEY_USE_DEFAULT_AUDIO=1
 
 voices:
   mudflap:
@@ -44,17 +61,60 @@ debug:
   log_level: INFO
 
 logging:
-  level: "DEBUG"
+  level: "INFO"
   format: "%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s"
   date_format: "%Y-%m-%d %H:%M:%S"
+  # quiet_third_party: true               # httpx / discord.gateway etc. at WARNING (default true)
+  # list_audio_devices_verbose: false     # full PyAudio device list at startup
+  # verbose_space_lord_api_log: false     # full OpenAI prompts at INFO
+  # verbose_voice_listener_startup: false # long mic device list at startup
 
 discord_voice_transcribe:
   enabled: true
+  # discord_transcribe_mode: speaker_local  # VC detects speaker; Voicemeeter B1 per user
+  # speaker_local_fallback_vc_decode: true   # also VC decode when B1 is quiet (default on)
+  # discord_vc | voicemeeter | both — where Whisper gets Discord audio from
+  # discord_audio_source: discord_vc
+  # discord_join_voice_channel: true
+  # receive_vc_audio: false
+  prevent_discord_transcript_posts: true
+  post_transcripts_to_discord: false
+  mirror_transcripts_to_gui: true
   output_channel_id: 0
   # voice_channel_id: null
+  # Chunks: audio is batched until chunk_seconds of PCM (or idle flush after ~1s if you already
+  # have min_chunk_seconds). Short utterances may not flush until you pause ~1s with >= min audio.
   # chunk_seconds: 6
   # min_chunk_seconds: 2
-  # whisper_model: whisper-1
+  # whisper_model: whisper-1          # classic Whisper verbose_json + segment filters
+  # whisper_model: gpt-4o-mini-transcribe   # newer STT; json/text only (no segment quality gate)
   # language: null
   # discord_rest_tls_verify: true
-
+  # mirror_transcripts_to_gui: true
+  # mirror_vc_activity_to_gui: false   # omit "heard ~Xs (transcribing…)" VC hints from GUI
+  # post_transcripts_to_discord: false   # when false, transcripts only in terminal + GUI
+  # language: en
+  # whisper_temperature: 0
+  # min_peak_amplitude: 1500             # skip quiet VC chunks (reduces made-up text)
+  # max_no_speech_prob: 0.45
+  # max_compression_ratio: 2.35
+  # Seconds to wait after Discord bootstrap before spawning VC listen (helps avoid voice WS 4006).
+  # voice_worker_start_delay_seconds: 12
+  # voice_connect_delay_seconds: 5
+  # Read Twitch chat + Space Lord replies aloud in Discord voice (requires discord_join_voice_channel).
+  # tts_to_discord: true
+  # read_discord_vc_aloud: true   # TTS for other VC users; skips discord_vc_skip_display_names + LOCAL mic
+  # Per-speaker Discord VC transcribe (in addition to Voicemeeter phone audio):
+  # discord_audio_source: both
+  # receive_vc_audio: true
+  # discord_audio_source: voicemeeter
+  # voicemeeter_bus: B1
+  # local_microphone_transcribe: true
+  # local_microphone_label: "Discord"
+  # local_microphone_device: "Voicemeeter Out A1"
+  # Local PC mic with VC listen (discord_audio_source: both) — separate label per speaker in VC.
+  # local_microphone_transcribe: false
+  # local_microphone_label: "Host"
+  # local_microphone_device: null
+  # local_microphone_rms_threshold: 400
+  # local_microphone_frame_ms: 50

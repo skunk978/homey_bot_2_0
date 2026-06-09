@@ -26,6 +26,26 @@ import httpx
 import discord
 from discord.ext import commands as discord_commands
 
+
+def _discord_snowflake_id(value: Any) -> int:
+    """Normalize Discord snowflakes from YAML (quoted ids load as str)."""
+    if isinstance(value, int):
+        return value
+    return int(str(value).strip())
+
+
+async def _resolve_discord_channel(client: discord.Client, channel_id_raw: Any):
+    """Resolve a channel from cache or HTTP."""
+    cid = _discord_snowflake_id(channel_id_raw)
+    ch = client.get_channel(cid)
+    if ch is not None:
+        return ch
+    try:
+        return await client.fetch_channel(cid)
+    except discord.HTTPException:
+        return None
+
+
 # Try to import GUI functions
 try:
     from gui_monitor import add_gui_message
@@ -122,10 +142,14 @@ class SpaceLord:
                     
                     # Get the persona channel
                     channel_id = self.config['discord']['persona_channel_id']
-                    channel = client.get_channel(channel_id)
-                    
+                    channel = await _resolve_discord_channel(client, channel_id)
+
                     if not channel:
-                        logger.error(f"[Space Lord] ❌ Could not find Discord channel {channel_id}")
+                        logger.error(
+                            "[Space Lord] ❌ Could not resolve Discord channel {} "
+                            "(bot must be in the server and able to see the channel)",
+                            channel_id,
+                        )
                         return
                     
                     logger.info(f"[Space Lord] 📖 Fetching persona from Discord channel: {channel.name}")

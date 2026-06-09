@@ -1,0 +1,326 @@
+================================================================================
+HOMEY BOT 2.0 — CODEBASE OUTLINE
+================================================================================
+
+A Windows-based streaming assistant that reads Twitch chat aloud, runs an AI
+persona called Space Lord, and optionally transcribes Discord voice / local
+microphone audio. Everything is driven from config.yaml and launched via
+homey_bot_space_lord.py.
+
+
+================================================================================
+1. PURPOSE & HIGH-LEVEL FLOW
+================================================================================
+
+  Input sources          Processing              Output
+  -------------          ----------              ------
+  Twitch chat      -->   TTS (Windows SAPI)  --> Desktop speakers
+  Discord VC       -->   Space Lord (GPT)    --> Discord voice (TTS)
+  Local PC mic     -->   Whisper (OpenAI)    --> GUI monitor
+  Voicemeeter bus  -->   Memory to Discord   --> twitch_messages.log
+
+The bot is designed for OBS capture: TTS goes to Windows default (or configured)
+playback so stream audio can pick it up.
+
+
+================================================================================
+2. ENTRY POINT & STARTUP
+================================================================================
+
+  File                      Role
+  ----                      ----
+  homey_bot_space_lord.py   Main entry — run this or run_bot.bat
+  config.yaml               Secrets & settings (gitignored; copy from config.example.yaml)
+  bot_process_guard.py      Kills stale bot/worker processes; startup lock prevents duplicates
+
+Startup sequence:
+
+  1. _ensure_single_instance() — stop old PIDs, write .homey_bot.pid
+  2. Load config.yaml, apply logging prefs and optional env overrides
+     (HOMEY_DISCORD_BOT_TOKEN, HOMEY_AUDIO_DEVICE, etc.)
+  3. Create HomeyBotHost -> DesktopAudioPlayer + DesktopTTS + TwitchBot
+  4. Auto-start gui_monitor.py in a background thread (if import succeeds)
+  5. Start audio processor, then Twitch bot with retry logic
+  6. On exit: cleanup Discord worker processes, remove lock file
+
+
+================================================================================
+3. CORE CLASSES (in homey_bot_space_lord.py)
+================================================================================
+
+HomeyBotHost
+  - Orchestrator: loads config, wires audio/TTS/Twitch, starts/stops everything
+  - Resolves audio device from CLI args, config, or env vars
+
+DesktopAudioPlayer
+  - Async queue-based playback via PyAudio (primary) or pygame (fallback)
+  - Device routing: default / pc / auto, explicit name substring, or bluetooth
+  - Intended for OBS-friendly desktop output
+
+DesktopTTS
+  - Converts text -> WAV via Windows SAPI (win32com)
+  - Auto-selects a female voice (prefers Zira) for Twitch chat readout
+  - Caches generated WAV files; retries on failure
+
+TwitchBot (extends TwitchIO 3 commands.Bot)
+  - Connects via EventSub (channel.chat.message), not legacy IRC
+  - On each chat message:
+      - Logs to twitch_messages.log
+      - Speaks "{username} says: {message}" via TTS (Discord VC when enabled, else desktop)
+      - Enqueues line for Space Lord pipeline
+  - Spawns Discord voice worker processes when configured
+  - Manages Voicemeeter/local mic capture threads
+  - Optional wake-word listener (twitch.local_voice_listener)
+
+SpaceLord (primary implementation — lives in main file)
+  - AI persona powered by OpenAI Chat Completions
+  - Loads persona and memories from Discord channels (or local .txt fallbacks)
+  - Three-stage LLM pipeline per message:
+      1. should_respond — yes/no gate (30s cooldown)
+      2. respond_to_chat — in-character reply (<100 words)
+      3. should_remember -> create_memory_entry -> post to Discord memories channel
+  - Conversation worker thread serializes Space Lord decisions across
+    Twitch / Discord / LOCAL sources
+
+VoiceListener (optional)
+  - Google Speech Recognition on PC mic
+  - Wake phrases: "hey space lord", "hey mudflap", etc.
+  - Can run with wake word off for testing (every phrase -> command handler)
+
+NOTE: space_lord.py is a standalone/older Space Lord module with similar logic;
+the running bot uses the SpaceLord class inside homey_bot_space_lord.py.
+
+
+================================================================================
+4. INPUT CHANNELS
+================================================================================
+
+A. Twitch Chat
+  - TwitchIO 3 + EventSub user token
+  - Requires user:read:chat, client_id, client_secret, bot_id, refresh_token
+  - always_read_chat: true -> every message spoken aloud
+  - space_lord_enabled: true -> AI may also reply when addressed
+
+B. Discord Voice Transcription
+  Split into two OS processes (multiprocessing spawn) connected by queues:
+
+    Process     File                            Job
+    -------     ----                            ---
+    Listen      discord_voice_listen_process.py Join Discord VC, receive Opus audio, chunk to WAV
+    Transcribe  discord_transcribe_process.py   Send WAV -> OpenAI Whisper, filter hallucinations, log/post
+
+  Audio source modes (discord_voice_transcribe config):
+
+    Mode          How it works
+    ----          ------------
+    discord_vc    Decode incoming Discord voice packets directly
+    voicemeeter   Record Voicemeeter Out bus (e.g. B1) where Discord output is routed
+    both          VC decode + Voicemeeter
+    speaker_local VC detects who is speaking; record Voicemeeter playback per user
+                  (discord_speaker_local_capture.py)
+
+  Local mic paths (discord_voice_local_mic.py):
+  - Voicemeeter playback bus -> labeled "Discord" or per-speaker name
+  - Physical laptop mic -> labeled "LOCAL" (WASAPI shared mode via sounddevice when
+    Discord holds the device)
+  - Device resolution via audio_device_detect.py (follows Windows default headset,
+    not stale config names)
+
+  Transcripts flow to:
+  - Terminal logs
+  - GUI live feed (when mirror_transcripts_to_gui: true)
+  - Space Lord conversation queue (LOCAL / DISCORD lines)
+  - Optional Discord text channel (post_transcripts_to_discord)
+
+C. Local Wake-Word Mic (optional, usually off)
+  - twitch.local_voice_listener: false by default
+  - When off, Discord/LOCAL/Twitch transcripts go straight to Space Lord
+    should_respond — no wake phrase needed
+
+
+================================================================================
+5. OUTPUT CHANNELS
+================================================================================
+
+TTS Routing
+  - Twitch chat readout -> female voice -> Discord VC if tts_to_discord: true,
+    else desktop speakers
+  - Space Lord replies -> male voice (ChristopherNeural / SAPI male) ->
+    Discord VC via discord_voice_speak.py
+  - Fallback: desktop DesktopAudioPlayer if Discord queue fails
+
+Discord Voice Speak (discord_voice_speak.py)
+  - Generates WAV with Windows SAPI in the listen process
+  - Plays into the connected Discord VoiceClient
+
+GUI Monitor (gui_monitor.py)
+  - Tkinter window with:
+      - Currently speaking
+      - Recent messages (Twitch, Discord, LOCAL, Space Lord)
+      - Discord persona/memories breakdown
+      - Space Lord API call history (should_respond / generate_response)
+      - Local mic mute toggle (local_mic_control.py)
+
+
+================================================================================
+6. SPACE LORD AI PIPELINE (DETAIL)
+================================================================================
+
+  Message arrives (Twitch / Discord transcript / LOCAL transcript)
+          |
+          v
+  _enqueue_conversation() -> background worker thread
+          |
+          v
+  should_respond(username, message)     <- OpenAI yes/no + 30s cooldown
+          | (no -> stop)
+          v
+  respond_to_chat(username, message)    <- OpenAI in-character reply
+          |
+          +--> TTS: "Space Lord says: {response}" (male, Discord VC)
+          |
+          +--> should_remember? -> extract_key_information -> post to Discord memories channel
+
+Context sources for prompts:
+  - Discord persona channel messages (system prompt)
+  - Discord memories channel (long-term facts)
+  - Rolling recent chat deque (short-term context)
+  - Local fallbacks: space_lord_persona.txt, space_lord_memories.txt
+
+
+================================================================================
+7. SHARED INFRASTRUCTURE
+================================================================================
+
+discord_voice_common.py
+  - Config parsing helpers, PCM/WAV utilities, OpenAI client factory
+  - Voicemeeter device name resolution
+  - Discord channel/snowflake helpers, TLS/truststore setup
+  - Feature flags: receive_vc_audio, join_discord_voice_channel,
+    speaker_gated_local_transcribe
+
+audio_device_detect.py
+  - Detects Windows default input/output devices
+  - Builds an AudioCapturePlan for Voicemeeter vs physical mic routing
+
+bot_process_guard.py
+  - Finds and kills orphaned python.exe processes running bot scripts
+  - Startup lock file (.homey_bot.startup.lock) prevents race on restart
+
+twitch_oauth_get_tokens.py
+  - One-shot helper to obtain Twitch OAuth tokens (authorization code or device flow)
+  - Writes tokens into config.yaml
+
+
+================================================================================
+8. CONFIGURATION SECTIONS (config.yaml)
+================================================================================
+
+  Section                  Controls
+  -------                  --------
+  twitch                   Bot token, channel, EventSub credentials, chat reading,
+                           Space Lord toggle, local voice listener
+  discord                  Bot token, voice channel, persona/memories channel IDs
+  openai                   API key, model, tokens, temperature, TLS options
+  audio                    Playback device for desktop TTS
+  voices                   Edge/SAPI voice names for Mudflap (female) and Space Lord (male)
+  discord_voice_transcribe Whisper settings, chunk timing, audio source, Voicemeeter buses,
+                           GUI mirroring, TTS-to-Discord
+  logging / debug          Verbosity, third-party log suppression, verbose API logs
+
+
+================================================================================
+9. DEPENDENCIES (requirements.txt)
+================================================================================
+
+  Twitch:    twitchio[starlette]
+  Discord:   discord.py[voice], discord-ext-voice-recv (receive VC audio)
+  Audio:     pyaudio, sounddevice, numpy, pygame
+  TTS:       pywin32 (Windows SAPI)
+  AI:        openai, httpx, truststore
+  Speech:    SpeechRecognition (Google STT for wake words)
+  Config:    pyyaml
+  Logging:   loguru (used in standalone space_lord.py)
+
+
+================================================================================
+10. REPO FILE LAYOUT
+================================================================================
+
+  Main / entry
+    homey_bot_space_lord.py     Main bot (Twitch + TTS + Space Lord + orchestration)
+    run_bot.bat                   Windows launcher
+    config.example.yaml           Config template (secrets go in config.yaml)
+    README.md                     Quick start
+
+  Space Lord / persona
+    space_lord.py                 Standalone/legacy Space Lord module (not the live entry point)
+    space_lord_persona.txt        Offline persona fallback
+    space_lord_memories.txt       Offline memories fallback
+
+  Discord voice pipeline
+    discord_voice_listen_process.py   OS process: join VC, capture audio, TTS playback
+    discord_transcribe_process.py     OS process: Whisper transcription
+    discord_voice_common.py           Shared helpers (PCM, config, OpenAI client)
+    discord_voice_speak.py            TTS WAV generation + play on Discord VC
+    discord_voice_local_mic.py        Local/Voicemeeter mic capture threads
+    discord_speaker_local_capture.py  Per-speaker Voicemeeter gating
+    discord_voice_transcribe.py       (legacy/auxiliary transcribe module)
+
+  Audio / process management
+    audio_device_detect.py        Windows device detection and capture plan
+    local_mic_control.py          GUI <-> capture thread mute flag
+    bot_process_guard.py          Single-instance and stale process cleanup
+
+  GUI / utilities
+    gui_monitor.py                Tkinter live monitor
+    twitch_oauth_get_tokens.py    Twitch OAuth token helper
+    test_bot_layout.py            Unit tests
+
+  Docs / runtime artifacts
+    WORKING_CONFIGURATION_BENCHMARK.md   Setup notes and troubleshooting
+    CODEBASE_OUTLINE.txt                 This file
+    twitch_messages.log                  Chat log (created at runtime)
+    temp_*.wav                           Ephemeral TTS output files
+
+
+================================================================================
+11. TYPICAL RUNTIME ARCHITECTURE
+================================================================================
+
+  homey_bot_space_lord.py (main asyncio process)
+  |
+  +-- GUI thread (tkinter)
+  +-- DesktopAudioPlayer async task
+  +-- TwitchBot (EventSub websocket)
+  |     +-- conversation worker thread (Space Lord)
+  |     +-- transcribe GUI mirror async task
+  |     +-- voicemeeter capture async task
+  |     +-- discord-local-mic thread(s)
+  |     +-- discord-speaker-local thread
+  |     +-- VoiceListener thread (optional)
+  +-- discord-transcribe process  <-- WAV queue --> discord-listen process
+  |                                              +-- speak queue (TTS playback)
+  +-- bot_process_guard (startup only)
+
+
+================================================================================
+12. WHAT IT DOES NOT DO
+================================================================================
+
+  - No web server or cloud deployment — runs locally on Windows
+  - No Discord bot commands beyond voice join/transcribe/TTS (persona fetch is
+    read-only at startup)
+  - space_lord.py is not the live entry point; homey_bot_space_lord.py is
+  - Twitch chat reading and Space Lord are independent: chat is always read aloud;
+    Space Lord only speaks when the LLM gate says yes
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+Homey Bot 2.0 is a Twitch chat TTS bot with an optional AI co-host (Space Lord)
+that listens across Twitch, Discord voice, and local mic, speaks replies into
+Discord or desktop audio, and maintains persona/memories via Discord channels —
+all monitored through a local GUI.
